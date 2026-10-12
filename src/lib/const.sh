@@ -158,6 +158,7 @@ WGOBF_WG_CONF="/etc/wireguard/${WGOBF_IF}.conf"
 WGOBF_LIB="/usr/local/lib/awg2"
 WGOBF_BIN="$WGOBF_LIB/wg-obfuscator"
 WGOBF_FW="$WGOBF_LIB/wgobf-fw.sh"
+WGOBF_AA_DIR="/etc/apparmor.d"   # профиль wg-quick (Ubuntu 25.10+) и его local-дополнение
 WGOBF_UNIT="awg-wgobf.service"
 WGOBF_CLIENTS="/root/wgobf"
 WGOBF_TAG="awg-wgobf"
@@ -173,6 +174,10 @@ WEB_CONF="/etc/awg-web.conf"
 WEB_UNIT="awg-web.service"
 WEB_LOG="/var/log/awg-web.log"
 WEB_DIR="/etc/awg-web"
+WEB_FW_SCRIPT="/usr/local/bin/awg2-web-fw"   # правило доступа к порту панели (по адресам / через VPN)
+WEB_NETS_FILE="$WEB_DIR/access.nets"          # кому можно — его же проверяет сама панель
+WEB_SET="awg2-web"; WEB_SET6="awg2-web6"; WEB_FW_TAG="awg2-webacl"
+WEB_FW_UNIT="awg2-web-fw.service"           # то же правило при загрузке — раньше UFW и netfilter-persistent
 BOT_PROXY_SCHEMES="http https socks4 socks5 socks5h iface"
 WEBAPP_PORT_DEFAULT=8443                    # Mini App бота (WEBAPP_PORT в BOT_CONF)
 

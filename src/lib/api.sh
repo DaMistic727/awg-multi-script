@@ -481,7 +481,7 @@ _api_warp() {
   case "$a" in
     status)
       { _kv backend "$be"; _kv up:b "$(_b warp_is_up)"
-        _kv configured:b "$([[ -f "$WARP_CONF" || -s "$USQUE_CONF" ]] && echo 1 || echo 0)"
+        _kv configured:b "$(_b warp_configured)"
         _kv failed:b "$(_b test -f "$WARP_STATE.failed")"
         _kv health:b "$(_b unit_active awg-warp-healthcheck.timer)"
         _kv wg_possible:b "$(_b warp_wg_possible)"; _kv usque_possible:b "$(_b warp_usque_possible)"; } | api_obj
@@ -659,6 +659,14 @@ _api_wgobf() {
         if wgobf_installed; then
           _kv endpoint "$(wgobf_get ENDPOINT):$(wgobf_get PORT)"; _kv masking "$(wgobf_get MASKING)"
           _kv clean:b "$(wgobf_get ALLOW_CLEAN)"; _kv clients:n "$(wgobf_clients | grep -c . || true)"
+          # Выход для всех и новых клиентов и туннели на выбор: none | off | up,
+          # свои выходы Xray (если Xray их умеет) и exit-ноды
+          _kv route "$(r=$(wgobf_get ROUTE); echo "${r:-direct}")"
+          _kv warp "$(if warp_is_up; then echo up; elif warp_configured; then echo off; else echo none; fi)"
+          _kv xray "$(if ! xray_installed; then echo none; elif xray_is_up; then echo up; else echo off; fi)"
+          _kv xray_tags:j "$({ xray_installed && xray_tun_supported && xray_tags; } | py json-list)"
+          _kv exits "$(if [[ -z "$(exits_nodes)" ]]; then echo none; elif exits_is_up; then echo up; else echo off; fi)"
+          _kv exit_nodes:j "$(exits_nodes | py json-list)"
         fi; } | api_obj
       wgobf_installed && wgobf_status
       return 0 ;;
@@ -674,8 +682,9 @@ _api_wgobf() {
         read -r hs rx tx < <(awk -v k="$pub" '$1 == k {print $5, $6, $7; exit}' <<< "$dump") || true
         [[ "${hs:-}" =~ ^[0-9]+$ ]] && (( hs > 0 )) && hs=$((now - hs)) || hs=""
         [[ "${rx:-}" =~ ^[0-9]+$ ]] || rx=0; [[ "${tx:-}" =~ ^[0-9]+$ ]] || tx=0
-        printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx"
-      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n ;;
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx" "$(wgobf_route_of "${ip%/32}")"
+      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n route ;;
+    route) wgobf_route_set "${1:-}" "${2:-}" ;;
     add|del|bundle)
       name="${1:-}"
       [[ -n "$name" ]] || { _api_usage "wgobf $a ИМЯ"; return; }
@@ -697,7 +706,7 @@ _api_wgobf() {
     clean) wgobf_set_clean "${1:-}" ;;
     rotate-key) wgobf_rotate_key ;;
     remove) wgobf_remove quiet ;;
-    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
+    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|route ИМЯ|all direct|warp|xray[:выход]|exits[:нода]|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
   esac
 }
 
@@ -813,6 +822,9 @@ _api_web() {
       { _kv installed:b "$(_b web_installed)"; _kv active:b "$(_b web_active)"
         if web_installed; then
           _kv url "$(web_url)"; _kv user "$(web_conf_get WEB_USER)"; _kv port:n "$(web_conf_get WEB_PORT)"
+          # Доступ: all | ip | vpn, список адресов и адрес панели изнутри VPN
+          _kv access "$(web_access_mode)"; _kv allow:j "$(web_access_allow | py json-list)"
+          _kv vpn_url "$(web_vpn_url 2>/dev/null)"; _kv vpn_nets:j "$(web_vpn_nets | py json-list)"
         fi
         _kv cert:b "$(_b cert_installed)"; _kv cert_name "$(cert_get name)"; _kv cert_expires:n "$(cert_expires)"
       } | api_obj ;;
@@ -825,8 +837,9 @@ _api_web() {
       web_installed || { err "Веб-панель не установлена"; return 1; }
       web_restart ;;
     stop) web_stop ;;
+    access) web_access_set "$@" ;;
     remove) web_installed || { err "Веб-панель не установлена"; return 1; }; web_remove quiet ;;
-    *) _api_usage "web status|install|password|path|restart|start|stop|remove" ;;
+    *) _api_usage "web status|install|password|path|restart|start|stop|access all|vpn|ip АДРЕС...|remove" ;;
   esac
 }
 

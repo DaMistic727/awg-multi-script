@@ -419,7 +419,8 @@ function tzRefresh() {
 function favRefresh() {
   const fav = document.getElementById("favicon");
   if (!fav) return;
-  const st = S.status || {}, cc = String(st.country || "").replace(/[^A-Z]/g, "").slice(0, 2);
+  // Без входа (экран входа, сессия кончилась) сведений о сервере нет — и флага страны тоже
+  const st = (S.me && S.status) || {}, cc = String(st.country || "").replace(/[^A-Z]/g, "").slice(0, 2);
   const set = (href) => { if (fav.getAttribute("href") !== href) fav.href = href; };
   if (!WEB || LOOK.tab !== "flag" || !cc) { set(tzIcon()); return; }
   const dot = { "": "#22c55e", bad: "#ef4444", off: "#9ca3af" }[srvPulse(st)];
@@ -429,7 +430,7 @@ function favRefresh() {
   set("data:image/svg+xml;charset=utf-8," + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
     <defs><clipPath id="c"><rect y="5" width="32" height="22" rx="4"/></clipPath></defs><g clip-path="url(#c)">${body}</g>
     <rect x=".5" y="5.5" width="31" height="21" rx="3.5" fill="none" stroke="rgba(0,0,0,.25)"/>
-    <circle cx="26" cy="25" r="5.5" fill="${dot}" stroke="#fff" stroke-width="2"/></svg>`));
+    <circle cx="25.5" cy="25" r="5.5" fill="${dot}" stroke="#fff" stroke-width="2"/></svg>`));
 }
 
 function applyLook(save = false) {
@@ -509,10 +510,12 @@ function lookPanel() {
         h("div", { class: "eyebrow tsep" }, "фон"),
         slider("bgHue", "Оттенок фона", 0, 360, LOOK.bgHue != null ? LOOK.bgHue : 220, "°", "hue"),
         slider("tint", "Тонировка", 0, 40, LOOK.tint, "%"),
-        WEB ? h("div", {}, h("div", { class: "eyebrow tsep" }, "значок вкладки браузера"), h("div", { class: "even2", "data-name": "tab-icon" },
+        // Заголовок раздела — прямо в сетке, как у «фон» и «форма»: его отрицательный
+        // нижний отступ рассчитан на зазор сетки, внутри обёртки кнопки наезжали на него
+        WEB ? [h("div", { class: "eyebrow tsep" }, "значок вкладки браузера"), h("div", {}, h("div", { class: "even2", "data-name": "tab-icon" },
           [["logo", "Знак Тулзы"], ["flag", "Флаг страны"]].map(([k, t]) =>
             h("button", { class: "chip" + (LOOK.tab === k ? " on" : ""), onclick: () => { LOOK.tab = k; applyLook(true); favRefresh(); draw(); } }, t))),
-        h("div", { class: "muted small", style: "margin-top:6px" }, "много вкладок с разными серверами — флаг страны и точка состояния awg0")) : null,
+        h("div", { class: "muted small", style: "margin-top:6px" }, "много вкладок с разными серверами — флаг страны и точка состояния awg0"))] : null,
         h("div", { class: "eyebrow tsep" }, "форма и размер"),
         slider("rb", "Скругление углов", 0, 24, LOOK.rb, " px"),
         slider("zoom", "Масштаб", ZOOM_MIN, ZOOM_MAX, LOOK.zoom, "%"),
@@ -1466,19 +1469,47 @@ function routesView(rows, mdl) {
   ];
 }
 
-// Клиенты WG + обфускатора в виде «список»: одна строка — все идут напрямую,
+// Клиенты WG + обфускатора в виде «список»: строка на выход (напрямую, WARP),
 // клиенты чипами (нажатие — карточка клиента обфускатора)
-function wgobfRoutes(wrows) {
-  const on = wrows.filter((c) => c.online).length, n = wrows.length;
-  const total = wrows.reduce((a, c) => a + (c.today || 0), 0);
-  return h("div", { class: "rlist" }, h("div", { class: "rx", onclick: () => go("/wgobf") },
-    h("i", { class: "sw", style: "background:var(--muted)" }),
-    h("div", { class: "rm" }, h("b", {}, "wgobf0 → напрямую"),
-      h("span", {}, `${n} ${plural(n, "клиент", "клиента", "клиентов")}` + (on ? ` · ${on} в сети` : " · никого в сети")),
-      h("div", { class: "rc" }, sortRows(wrows, "activity").map((c) => h("a", { class: "cchip" + (c.online ? " on" : ""), title: c.sub,
-        onclick: (ev) => { ev.stopPropagation(); go("/wgobf/client/" + encodeURIComponent(c.name)); } }, c.name)))),
-    h("div", { class: "rv" }, fmtBytes(total), h("small", {}, "с запуска"))));
+function wgobfRoutes(wrows, wmdl) {
+  const groups = wmdl.ex.map((e) => ({ e, rows: wrows.filter((c) => wmdl.of[c.name] === e.id) })).filter((g) => g.rows.length);
+  return h("div", { class: "rlist" }, groups.map(({ e, rows }) => {
+    const on = rows.filter((c) => c.online).length, n = rows.length, total = rows.reduce((a, c) => a + (c.today || 0), 0);
+    return h("div", { class: "rx", onclick: () => go("/wgobf") },
+      h("i", { class: "sw", style: `background:${e.c}` }),
+      h("div", { class: "rm" }, h("b", {}, `wgobf0 → ${e.id === "direct" ? "напрямую" : exitLabel(e)}`),
+        h("span", {}, `${n} ${plural(n, "клиент", "клиента", "клиентов")}` + (on ? ` · ${on} в сети` : " · никого в сети")),
+        h("div", { class: "rc" }, sortRows(rows, "activity").map((c) => h("a", { class: "cchip" + (c.online ? " on" : ""), title: c.sub,
+          onclick: (ev) => { ev.stopPropagation(); go("/wgobf/client/" + encodeURIComponent(c.name)); } }, c.name)))),
+      h("div", { class: "rv" }, fmtBytes(total), h("small", {}, "с запуска")));
+  }));
 }
+
+// Выход клиента обфускатора: direct | warp | xray[:выход] | exits[:нода]. Работает
+// только поднятый туннель (в сводке обфускатора warp/xray/exits === "up"), остальные —
+// честно «пока напрямую»
+const WG_TUN = { warp: "WARP", xray: "Xray", exits: "exit-ноды" };
+const wgobfSplit = (route) => { const p = (route || "direct").split(":"); return [p[0], p.slice(1).join(":")]; };
+const wgobfRouteLabel = (route) => {
+  const [k, sub] = wgobfSplit(route);
+  return k === "warp" ? "через WARP" : k === "xray" ? (sub ? "через Xray: " + sub : "через Xray")
+    : k === "exits" ? (sub ? "через exit-ноду " + sub : "через exit-ноды") : "напрямую";
+};
+const wgobfIdle = (route, d) => {
+  const k = wgobfSplit(route)[0], st = (d || {})[k] || "none";
+  if (!WG_TUN[k] || st === "up") return "";
+  return k === "exits" ? (st === "off" ? "exit-ноды выключены" : "exit-нод нет") : `${WG_TUN[k]} ${st === "off" ? "выключен" : "не настроен"}`;
+};
+const wgobfRouteText = (route, d) => { const idle = wgobfIdle(route, d); return idle ? idle + " — пока напрямую" : wgobfRouteLabel(route); };
+// Выходы на выбор — только настроенные туннели; свои выходы Xray — если Xray их умеет
+const wgobfRouteOpts = (d) => {
+  const on = (k) => d[k] && d[k] !== "none", nodes = d.exit_nodes || [];
+  return [["direct", "Напрямую"]].concat(on("warp") ? [["warp", "WARP"]] : [],
+    on("xray") ? [["xray", "Xray"]].concat((d.xray_tags || []).map((t) => ["xray:" + t, "Xray · " + t])) : [],
+    on("exits") ? [["exits", "Exit-ноды"]].concat(nodes.length > 1 ? nodes.map((n) => ["exits:" + n, "Нода " + n]) : []) : []);
+};
+const wgobfPick = (d, cur, apply) => h("div", { class: "chips rchips" }, wgobfRouteOpts(d).map(([v, l]) => h("button", {
+  class: v === cur ? "on" : null, "data-v": v, title: l, onclick: (ev) => (v === cur ? null : apply(ev.currentTarget, v)) }, l)));
 
 // Схема: клиенты → сервер → выходы. Клиентов много — показаны самые активные.
 // opt — та же схема для WG + обфускатора: свой узел (hub), куда ведут нажатия
@@ -1758,12 +1789,30 @@ const evRow = (e) => h("div", { class: "ev", style: e.name && !/\s/.test(e.name)
 h("time", {}, e.day === todayIso() ? e.time : e.date), h("span", { class: "ic", style: `color:${e.col};background:color-mix(in srgb, ${e.col} 14%, transparent)` }, icon(e.ic)),
 h("div", { class: "t" }, e.t, e.x ? h("span", { class: "x" }, e.x) : null));
 
+// «Нужна перезагрузка» можно убрать крестиком — на этом устройстве и до нового
+// повода: текст другой (новое ядро — другой номер), и замечание вернётся.
+// Серьёзное (awg0 лежит, ядро без модуля) не убирается
+const hiddenAlerts = () => { try { const a = JSON.parse(pref("hidden-alerts", "[]")); return Array.isArray(a) ? a : []; } catch (_) { return []; } };
+const alertHidden = (t) => hiddenAlerts().indexOf(t) >= 0;
+const hideAlert = (t) => setPref("hidden-alerts", JSON.stringify(hiddenAlerts().filter((x) => x !== t).concat([t]).slice(-10)));
+// Повод сменился или пропал (перезагрузились) — «убрано» по нему забывается: тексты
+// «обновлены пакеты» и «в памяти прежняя сборка модуля» не меняются, и без этого
+// следующий такой повод остался бы скрытым навсегда. known — сводка получена
+const forgetAlerts = (known, reason) => { const was = hiddenAlerts(), keep = was.filter((x) => x === reason);
+  if (known && keep.length !== was.length) setPref("hidden-alerts", JSON.stringify(keep)); };
+// Карточка замечаний: [текст, куда ведёт, можно убрать]
+const alertCard = (alerts) => (alerts.length ? h("div", { class: "card warn", "data-name": "alerts" }, alerts.map(([a, path, can]) =>
+  h("div", { class: "row", style: "cursor:pointer;padding:3px 0", onclick: () => go(path) }, icon("triangle-alert"), h("span", { class: "grow" }, a),
+    can ? h("button", { class: "ibtn sm", "aria-label": "Убрать", title: "Убрать — до следующего раза",
+      onclick: (ev) => { ev.stopPropagation(); hideAlert(a); render(); } }, icon("x")) : null))) : null);
+
 // Предупреждения сервера — те же, что были на главной
 function homeAlerts(d) {
   const s = d.server || {}, c = d.components || {};
+  forgetAlerts(d.components, c.reboot);
   return [
     s.exists && !s.up ? ["awg0 не поднят — Сервер → Починить", "/server"] : null,
-    c.installed && c.reboot ? [c.reboot, "/server/module"] : null,
+    c.installed && c.reboot && !alertHidden(c.reboot) ? [c.reboot, "/server/module", !/не (собран|загружен)/.test(c.reboot)] : null,
     c.kernel_gap ? [`Ядро ${c.kernel_gap} без модуля AWG — пересобрать до перезагрузки`, "/server/module"] : null,
     d.update ? [`Доступна ${d.update} — обновить`, "/update"] : null,
   ].filter(Boolean);
@@ -1847,7 +1896,12 @@ route(/^\/$/, async (ctx) => {
   const wrows = (Array.isArray(wob) ? wob : []).map((c) => Object.assign({}, c, { online: wgobfOnline(c), blocked: false,
     handshake: c.ago != null, today: (c.rx || 0) + (c.tx || 0),
     sub: wgobfOnline(c) ? `в сети · ${fmtBytes((c.rx || 0) + (c.tx || 0))}` : c.ago != null ? `${fmtDur(c.ago)} назад` : "не подключался" }));
-  const wmdl = exitsModel(wrows, {}), won = wrows.filter((c) => c.online).length;
+  // Выход клиентов Phobos — в полях клиента AWG: туннель их маршрута, если он сейчас
+  // работает (активный туннель); tun2socks клиентов обфускатора не возит
+  const wmdl = exitsModel(wrows.map((c) => { const [k, sub] = wgobfSplit(c.route);
+    return Object.assign({}, c, { warp: k === "warp", xray: k === "xray", xray_out: k === "xray" ? sub : "",
+      exit_choice: k === "exits" ? sub || "shared" : "off" }); }), { kind: WG_TUN[r.kind] ? r.kind : "", main: r.main });
+  const won = wrows.filter((c) => c.online).length;
   for (const c of rows) c.online = liveOnline(c, S.live);
   const now = new Date();
   const eyebrow = now.toLocaleDateString("ru-RU", { weekday: "long", day: "numeric", month: "long" }) + " · "
@@ -1866,8 +1920,7 @@ route(/^\/$/, async (ctx) => {
     return ctx.put(head(eyebrow, "Сервер не создан", comp.installed ? "Компоненты стоят — осталось создать сервер: те же вопросы, что в меню awg2"
       : "Сначала компоненты AmneziaWG, затем сервер", [btn("✨ Создать сервер", () => go("/server/create"), "btn-primary"),
       btn("🖥 Сервер", () => go("/server"))]),
-    alerts.length ? h("div", { class: "card warn" }, alerts.map(([a, path]) => h("div", { class: "row", style: "cursor:pointer;padding:3px 0",
-      onclick: () => go(path) }, icon("triangle-alert"), a))) : null,
+    alertCard(alerts),
     h("div", { class: "kpis" }, kpiTxt("система", d.os || "—", null, h("span", {}, d.kernel || "")),
       kpi("компоненты", comp.installed ? "есть" : "нет", null, h("span", {}, comp.module ? "модуль " + comp.module : "модуль не собран")),
       kpiTxt("адрес", d.ip || "—", null, h("span", {}, d.host || "")),
@@ -1899,8 +1952,18 @@ route(/^\/$/, async (ctx) => {
   const rhLink = h("div", { class: "r" }, rlink(wrows.length && pref("routes-pane", "awg") === "w" ? 1 : 0));
   const vseg = (v) => h("div", { class: "seg rseg", role: "group", "aria-label": "Вид маршрутов" }, [["map", "схема"], ["list", "список"]].map(([k, t]) =>
     h("button", { class: v === k ? "on" : null, "aria-pressed": String(v === k), onclick: () => { setPref("routes", k); drawRoutes(); } }, t)));
+  // Подпись окна Phobos: сколько идут через туннель, сколько ждут выключенный туннель
+  const wtun = wrows.filter((c) => wmdl.of[c.name] !== "direct");
+  const widle = wrows.filter((c) => (c.route || "direct") !== "direct" && wmdl.of[c.name] === "direct");
+  const uniq = (v, i, a) => a.indexOf(v) === i;
+  const wviaT = wtun.map((c) => { const e = wmdl.get(wmdl.of[c.name]); return e.grp || e.short; }).filter(uniq).join("/");
+  const widleK = widle.map((c) => wgobfSplit(c.route)[0]).filter(uniq);
+  const idleT = widleK.length !== 1 ? "туннель выключен" : widleK[0] === "exits" ? "exit-ноды выключены" : WG_TUN[widleK[0]] + " выключен";
+  const wvia = [wtun.length ? (wtun.length === wrows.length ? "идут через " + wviaT : `через ${wviaT}: ${wtun.length}`) : "",
+    widle.length ? (widle.length === wrows.length ? idleT + " — пока напрямую" : `${idleT} — ${widle.length} пока напрямую`) : ""]
+    .filter(Boolean).join(" · ") || "идут напрямую";
   const wcap = () => h("div", { class: "muted small", style: "margin-top:6px" },
-    `${won} из ${wrows.length} ${plural(wrows.length, "клиента", "клиентов", "клиентов")} в сети · идут напрямую · трафик с запуска wgobf0`);
+    `${won} из ${wrows.length} ${plural(wrows.length, "клиента", "клиентов", "клиентов")} в сети · ${wvia} · трафик с запуска wgobf0`);
   const drawRoutes = () => {
     if (!ctx.live()) return;
     const v = pref("routes", "map") === "list" ? "list" : "map";
@@ -1909,7 +1972,7 @@ route(/^\/$/, async (ctx) => {
       tA.textContent = clErr ? "—" : `${rows.filter((c) => c.online).length}/${rows.length}`;
       tW.textContent = `${won}/${wrows.length}`;
       const wtopo = v === "map" ? h("div", { class: "topo" }) : null;
-      wgIn.replaceChildren(h("div", { class: "rhead" }, wcap(), vseg(v)), wtopo || wgobfRoutes(wrows));
+      wgIn.replaceChildren(h("div", { class: "rhead" }, wcap(), vseg(v)), wtopo || wgobfRoutes(wrows, wmdl));
       if (wtopo) requestAnimationFrame(() => { if (ctx.live()) topology(wtopo, wrows, wmdl, "WG + обфускатор",
         { hub: "wgobf0", hubPath: "/wgobf", exitPath: "/wgobf", key: "w", esub: (n) => `${fmtBytes(n)} с запуска`,
           cpath: (n) => "/wgobf/client/" + encodeURIComponent(n) }); });
@@ -1942,8 +2005,7 @@ route(/^\/$/, async (ctx) => {
   ctx.put(
     head(eyebrow, !s.up ? "awg0 не поднят" : alerts.length ? "Нужно внимание" : "Всё работает", sub, [
       btn("🩺 Проверить", () => go("/diag")), btn("➕ Новый клиент", () => go("/add"), "btn-primary")]),
-    alerts.length ? h("div", { class: "card warn" }, alerts.map(([a, path]) => h("div", { class: "row", style: "cursor:pointer;padding:3px 0",
-      onclick: () => go(path) }, icon("triangle-alert"), a))) : null,
+    alertCard(alerts),
     clErr ? clFail() : null,
     h("div", { class: "kpis" },
       kpi("в сети", kOnline, `/ ${rows.length}`, h("span", {}, tun ? `${tun} через ${via}` : "все напрямую"), () => go("/clients")),
@@ -2498,7 +2560,7 @@ route(/^\/add$/, async (ctx) => {
   const pro = d.profile === "pro";
   ctx.put(title("➕ Новый клиент"),
     h("label", {}, "Имя — латиница, цифры, _ и -, до 32"),
-    h("div", { class: "row" }, name, h("button", { onclick: () => { name.value = free(); } }, "🎲")),
+    h("div", { class: "row" }, name, h("button", { "aria-label": "Случайное имя", title: "Случайное имя", onclick: () => { name.value = free(); } }, "🎲")),
     exp.nodes,
     pro ? h("div", { style: "margin-top:12px" }, mimLabel, h("button", { class: "btn-block", onclick: async () => {
       const box = h("div", { class: "sheet" }, h("h3", {}, "🎭 Мимикрия"));
@@ -2571,11 +2633,10 @@ route(/^\/server$/, async (ctx) => {
   // Подсказка о переходе на 3.1 — не предупреждение: сервер на 2.0 — обычный выбор,
   // а переход — в «Протоколе»; в карточке — только то, что правда требует внимания
   const d = r.data || {};
-  const warnings = [d.reboot].filter(Boolean);
   const state = !d.exists ? "" : d.up ? "on" : "bad";
+  forgetAlerts(r.data, d.reboot);
   ctx.put(title("Сервер"),
-    warnings.length ? h("div", { class: "card warn small" }, warnings.map((w) => h("div", { class: "row", style: "padding:2px 0" },
-      icon("triangle-alert"), w))) : null,
+    d.reboot && !alertHidden(d.reboot) ? alertCard([[d.reboot, "/server/module", !/не (собран|загружен)/.test(d.reboot)]]) : null,
     d.exists ? ecard({ state, name: "awg0", attrs: { "data-name": "awg0" },
       right: pill(d.up ? "поднят" : "не поднят", d.up ? "ok" : "bad"),
       meta: [tag("AWG " + (d.proto || "?"), "accent"), tag(d.profile_label || PROFILES[d.profile] || d.profile || ""),
@@ -3719,6 +3780,7 @@ route(/^\/wgobf$/, async (ctx) => {
   const rows = (await call("wgobf", "clients")) || [];
   const online = rows.filter(wgobfOnline).length;
   const mask = (v) => quick(null, "Маскировка " + v, ["wgobf", "masking", v]);
+  const route = d.route || "direct", rk = wgobfSplit(route)[0], idle = wgobfIdle(route, d);
   ctx.put(title("Обфускатор"),
     ecard({ state: d.running ? "on" : "bad", name: "WG + обфускатор", attrs: { "data-name": "wgobf" },
       right: pill(d.running ? "работает" : "остановлен", d.running ? "ok" : "bad"),
@@ -3739,13 +3801,26 @@ route(/^\/wgobf$/, async (ctx) => {
     segText([["STUN", "STUN · видеозвонок"], ["NONE", "NONE · только XOR"]], d.masking, (v) => (v !== d.masking ? mask(v) : null)),
     h("div", { style: "margin-top:10px" }, switchRow("Чистый WG", "пускать и обычный WireGuard без обфускатора (iOS) — его DPI видит",
       d.clean, (on) => call("wgobf", "clean", on ? "1" : "0"))),
+    // Выход всех клиентов (и новых): напрямую или через туннель — тот же, что у клиентов AWG;
+    // своему клиенту — в его карточке
+    h("label", { "data-name": "wgobf-route" }, "Выход клиентов"),
+    wgobfPick(d, route, (b, v) => {
+      if (v.indexOf("xray") === 0) toast("Перенастраиваю Xray…", 4000);
+      return quick(b, "Клиенты обфускатора — " + wgobfRouteLabel(v), ["wgobf", "route", "all", v]);
+    }),
+    hint((idle ? idle + " — клиенты пока идут напрямую и уйдут туда, когда он включится. "
+      : rk === "warp" ? "Через WARP — сайты видят адрес Cloudflare, а не сервера. "
+        : rk !== "direct" ? "Сайты видят адрес выхода, а не сервера. " : "")
+      + (["warp", "xray", "exits"].some((k) => d[k] && d[k] !== "none") ? "Выбор — для всех клиентов и новых; своему — в его карточке."
+        : "Туннели не настроены — сначала Туннели → WARP, Xray или exit-ноды.")),
     h("h2", {}, "Клиенты"),
     btn("➕ Добавить клиента", () => go("/wgobf/add"), "btn-primary btn-block"),
     h("div", { style: "margin-top:10px" }, rows.length ? rows.map((c) => {
       const enc = encodeURIComponent(c.name);
       return ecard({ state: wgobfOnline(c) ? "on" : "", name: c.name, attrs: { "data-name": c.name },
         onopen: () => go(`/wgobf/client/${enc}`), right: wgobfSeen(c),
-        lines: [c.ip + (c.rx || c.tx ? ` · ↓ ${fmtBytes(c.rx)} ↑ ${fmtBytes(c.tx)}` : "")],
+        lines: [c.ip + (c.rx || c.tx ? ` · ↓ ${fmtBytes(c.rx)} ↑ ${fmtBytes(c.tx)}` : "")
+          + ((c.route || "direct") !== "direct" ? " · " + wgobfRouteLabel(c.route) : "")],
         acts: [act("file-text", "Комплект", () => go(`/wgobf/client/${enc}`)), act(WEB ? "download" : "send", TO("В чат", "Файл"), (b) => sendWgobf(b, c.name, "wgobf")),
           act("trash-2", "Удалить", (b) => quickAsk(b, `Удалить клиента ${c.name}?`, "Клиент удалён", ["wgobf", "del", c.name]), "bad")] });
     }) : h("div", { class: "card empty" }, "Клиентов нет")),
@@ -3760,7 +3835,7 @@ route(/^\/wgobf\/add$/, async (ctx) => {
   const name = h("input", { placeholder: "keenetic_home", maxlength: 32, autocapitalize: "off", autocomplete: "off" });
   ctx.put(title("Новый клиент"), hint("Клиент WG + обфускатор — комплект со ссылкой для Keenetic и конфигами."),
     h("label", {}, "Имя — латиница, цифры, _ и -, до 32"),
-    h("div", { class: "row" }, name, h("button", { onclick: () => { name.value = free(); } }, icon("dices"))),
+    h("div", { class: "row" }, name, h("button", { "aria-label": "Случайное имя", title: "Случайное имя", onclick: () => { name.value = free(); } }, icon("dices"))),
     btn("Создать", (b) => {
       const v = name.value.trim() || free();
       if (!/^[A-Za-z0-9_-]{1,32}$/.test(v)) return fail(new Error("Имя: латиница, цифры, _ и -, до 32"));
@@ -3775,13 +3850,21 @@ route(/^\/wgobf\/add$/, async (ctx) => {
 
 route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
   // Комплект не собрался — статус и мониторинг всё равно на экране, ошибка — плашкой
-  const [d, rows] = await Promise.all([post("/api/wgobf/bundle", { name }).catch((e) => ({ error: e.message })),
-    call("wgobf", "clients").catch(() => [])]);
+  const [d, rows, ws] = await Promise.all([post("/api/wgobf/bundle", { name }).catch((e) => ({ error: e.message })),
+    call("wgobf", "clients").catch(() => []), call("wgobf", "status").catch(() => null)]);
   const c = (rows || []).find((x) => x.name === name);
   if (d.error && !c) throw new Error(d.error);
   ctx.put(title(name, pill("обфускатор", "accent")),
     c ? h("div", { class: "card", "data-name": "wgobf-status" }, kv("Статус", wgobfSeen(c)), kv("Адрес", c.ip),
-      kv("Трафик с запуска", `↓ ${fmtBytes(c.rx)} · ↑ ${fmtBytes(c.tx)}`)) : null,
+      kv("Трафик с запуска", `↓ ${fmtBytes(c.rx)} · ↑ ${fmtBytes(c.tx)}`),
+      kv("Выход", wgobfRouteText(c.route, ws))) : null,
+    // Свой выход клиенту — прямо здесь: настроенные туннели, их выходы и ноды
+    c && ws ? h("div", { class: "card rcard", "data-name": "wgobf-client-route" }, h("div", { class: "eyebrow" }, "маршрут"),
+      wgobfPick(ws, c.route || "direct", (b, v) => busy(b, async () => {
+        if (v.indexOf("xray") === 0) toast("Перенастраиваю Xray…", 4000);
+        await call("wgobf", "route", name, v); haptic(); toast(`Выход ${name}: ${wgobfRouteLabel(v)}`); render();
+      })),
+      wgobfIdle(c.route, ws) ? hint(wgobfIdle(c.route, ws) + " — клиент пока идёт напрямую.") : null) : null,
     d.error ? h("div", { class: "card warn small" }, "Комплект клиента не собрался: " + d.error) : null,
     switchRow("Мониторинг", "сообщу в чат, когда клиент пропал (5 минут без связи) и когда вернулся", !!d.mon,
       (on) => post("/api/wgobf/mon", { name, on })),
@@ -4136,6 +4219,7 @@ route(/^\/log\/([a-z0-9-]+)$/, async (ctx, name) => {
 function showLogin(err = "") {
   token++;                       // недорисованный экран не затрёт форму входа своей ошибкой
   S.me = null;
+  favRefresh();                  // вкладка — снова знак Тулзы, флаг сервера только за входом
   // Экран, прерванный на перезагрузке, сам «reloading» уже не снимет (он не live) —
   // иначе форма входа приглушена и не нажимается. Снимки прежней сессии — тоже долой
   root.classList.remove("reloading");
@@ -4194,7 +4278,46 @@ async function webStart() {
 }
 
 const WEB_EVENTS = { LOGIN: ["вход", "ok"], FAIL: ["неверный пароль", "bad"], LOCK: ["блокировка", "bad"],
-  PASSWD: ["пароль сменён", "warn"], SESSIONS: ["сессии завершены", "warn"], CSRF: ["чужой сайт", "bad"] };
+  PASSWD: ["пароль сменён", "warn"], SESSIONS: ["сессии завершены", "warn"], CSRF: ["чужой сайт", "bad"],
+  ACCESS: ["доступ изменён", "warn"], DENY: ["чужой адрес", "bad"] };
+// Доступ к панели: для всех, по адресам (и через свой VPN) или только через VPN.
+// Режим, который закрыл бы панель от этого же адреса, awg2 не поставит
+function accessSection(a) {
+  a = a || {};
+  const st = { mode: a.mode || "all" };
+  const list = h("textarea", { class: "mono", placeholder: "1.2.3.4, 5.6.7.0/24, 2001:db8::/32", autocapitalize: "off",
+    spellcheck: "false", style: "min-height:72px" }, (a.allow || []).join(", "));
+  const items = () => list.value.split(/[\s,;]+/).filter(Boolean);
+  const body = h("div", { class: "acc-access" });
+  const draw = () => {
+    const parts = [segText([["all", "Для всех"], ["ip", "По адресам"], ["vpn", "Только через VPN"]], st.mode,
+      (k) => { st.mode = k; draw(); })];
+    if (st.mode === "ip") {
+      parts.push(list);
+      if (a.me && !a.me_vpn && !a.me_self && items().indexOf(a.me) < 0) {
+        parts.push(btn(`＋ Мой адрес ${a.me}`, () => { list.value = items().concat(a.me).join(", "); draw(); }, "btn-block"));
+      }
+    }
+    if (st.mode !== "all") {
+      parts.push(h("div", { class: "muted small", style: "margin:8px 2px" }, a.me_vpn ? "Ты сейчас зашёл через VPN."
+        : a.me_self ? "Ты зашёл с самого сервера (127.0.0.1 — например, SSH-туннель): так панель открывается всегда."
+        : `Ты зашёл не через VPN (${a.me || "?"})` + (st.mode === "vpn"
+          ? " — так не сохранить: панель закрылась бы для тебя. Подключись к VPN и открой адрес ниже." : ".")));
+      if (a.vpn_url) parts.push(kv("Изнутри VPN", h("span", { class: "mono" }, a.vpn_url)));
+    }
+    parts.push(btn("💾 Сохранить доступ", (b) => busy(b, async () => {
+      await post("/api/web/access", { mode: st.mode, allow: st.mode === "ip" ? items() : [] });
+      haptic(); toast("✅ Доступ сохранён", 3000); render();
+    }), "btn-primary btn-block"));
+    body.replaceChildren(...parts);
+  };
+  draw();
+  return [h("h2", {}, "Доступ к панели"), h("div", { class: "card" }, body),
+    hint("«По адресам» — только с них и через свой VPN (AWG, WG + обфускатор): сменился адрес дома — зайди через VPN. "
+      + "«Только через VPN» — снаружи порт закрыт для всех; изнутри VPN браузер предупредит о сертификате (он на внешний адрес). "
+      + "Прокси на этом сервере (3x-ui и т. п.) — как чужие адреса: пускать через них — добавь в список адрес самого сервера. "
+      + "Закрылась от тебя — SSH: sudo awg2 → Веб-панель → Доступ, или Telegram-бот → Веб-панель → Доступ.")];
+}
 route(/^\/account$/, async (ctx) => {
   if (!WEB) return ctx.put(title("Аккаунт"), h("div", { class: "card empty" }, "Есть только в веб-панели"));
   const d = await post("/api/web/account");
@@ -4207,6 +4330,7 @@ route(/^\/account$/, async (ctx) => {
       kv("Сертификат", d.cert === "self" ? h("span", { class: "warn" }, "самоподписанный") : "Тулзы (Let's Encrypt или готовый)")),
     d.cert === "self" ? hint("Браузер предупреждает о самоподписанном сертификате — соединение всё равно шифруется. "
       + "Настоящий: sudo awg2 → Веб-панель → Сертификат (на IP — Let's Encrypt, нужен свободный порт 80).") : null,
+    accessSection(d.access),
     h("h2", {}, "Сменить пароль"),
     h("div", { class: "card" }, old, nw, nw2,
       enterTo(btn("🔑 Сменить пароль", (b) => busy(b, async () => {

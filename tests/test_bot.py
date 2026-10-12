@@ -1125,6 +1125,57 @@ async def run():
     chk("архив для Linux — отдельной кнопкой", docs(sent) and docs(sent)[0].document.filename == "wgobf-clus.zip",
         [n for n, _ in sent])
 
+    # Выход клиентов обфускатора: на выбор — только настроенные туннели
+    text, buttons = screen(await press("wo"))
+    chk("обфускатор: «Выход клиентов: напрямую» и кнопка выбора выхода",
+        "Выход клиентов: <b>напрямую</b>" in text and ("🌐 Выход клиентов", "wo:rt:*") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:rt:*"))
+    chk("на выбор — настроенные туннели (WARP не настроен — его нет), свои выходы Xray, какой туннель работает",
+        ("🔘 Напрямую", "wo:rs:*|d") in buttons and not any(d == "wo:rs:*|w" for _, d in buttons)
+        and ("⚪️ Xray: по умолчанию", "wo:rs:*|x") in buttons and ("⚪️ Xray: de", "wo:rs:*|x0") in buttons
+        and "Работает туннель: exit-ноды." in text, [text, buttons])
+    warp_conf, wl = os.path.join(ROOT, "etc/wireguard/warp0.conf"), os.path.join(ROOT, "warp.peers.wgobf")
+    with open(warp_conf, "w") as f:
+        f.write("[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n")
+    text, buttons = screen(await press("wo:rt:*"))
+    chk("WARP настроен — «Через WARP» на выбор", ("⚪️ Через WARP", "wo:rs:*|w") in buttons
+        and ("🔘 Напрямую", "wo:rs:*|d") in buttons, buttons)
+    text, buttons = screen(await press("wo:rs:*|w"))
+    chk("«Через WARP» — адреса клиентов обфускатора в списке WARP, экран: выбрано, WARP выключен",
+        os.path.exists(wl) and open(wl).read().split() == ["10.77.1.2"] and ("🔘 Через WARP", "wo:rs:*|w") in buttons
+        and "через WARP</b> — WARP выключен, пока напрямую" in text, [text, buttons])
+    text, buttons = screen(await press("wo"))
+    chk("главный экран: «через WARP — WARP выключен, пока напрямую»",
+        "через WARP</b> — WARP выключен, пока напрямую" in text, text)
+    text, buttons = screen(await press("wo:v:clus"))
+    chk("карточка клиента: выход и кнопка «Маршрут»", "Выход: через WARP" in text
+        and ("🌐 Маршрут", "wo:rt:clus") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:list"))
+    chk("в списке клиентов — выход, если не напрямую", "🌐 через WARP" in text, text)
+    text, buttons = screen(await press("wo:rs:clus|d"))
+    chk("свой выход клиенту — «напрямую»: из списка WARP, экран клиента", not open(wl).read().strip()
+        and "Выход: clus" in text and ("🔘 Напрямую", "wo:rs:clus|d") in buttons, [text, buttons, open(wl).read()])
+    text, buttons = screen(await press("wo:rs:clus|x3"))
+    chk("устаревшая кнопка (выхода нет) — экран выбора заново, без записи", ("🔘 Напрямую", "wo:rs:clus|d") in buttons
+        and not open(wl).read().strip(), [text, buttons])
+    # Exit-ноды есть (две) — общий выход и каждая нода на выбор
+    ex_dir = os.path.join(ROOT, "etc/amnezia/amneziawg")
+    for n in ("q1", "q2"):
+        open(os.path.join(ex_dir, f"awg-exit-{n}.conf"), "w").close()
+    text, buttons = screen(await press("wo:rt:clus"))
+    chk("exit-ноды на выбор: общий выход и каждая нода", ("⚪️ Exit-ноды: общий", "wo:rs:clus|e") in buttons
+        and any(d.startswith("wo:rs:clus|e") and "Нода q2" in t for t, d in buttons), buttons)
+    q2 = next(d for t, d in buttons if "Нода q2" in t)
+    text, buttons = screen(await press(q2))
+    el = os.path.join(ex_dir, "exits_peers.list.wgobf")
+    chk("клиент → нода q2: в списке exit-нод обфускатора «адрес|нода», экран: выбрано (ноды работают)",
+        open(el).read().split() == ["10.77.1.2|q2"] and "через exit-ноду q2</b>\n" in text
+        and any(t.startswith("🔘 Нода q2") for t, _ in buttons), [text, buttons, open(el).read()])
+    await press("wo:rs:clus|d")
+    for n in ("q1", "q2"):
+        os.remove(os.path.join(ex_dir, f"awg-exit-{n}.conf"))
+    os.remove(warp_conf)
+
     # Трафик и мониторинг клиента обфускатора: dump wgobf0 — рукопожатие минуту назад
     import time as _t
     from awgbot import monitor as _mon
@@ -1240,6 +1291,10 @@ async def run():
         and webapp.check_init_data(init_data(111), "1:other") is None
         and webapp.check_init_data(init_data(111, auth=time.time() - 3 * 86400), token) is None
         and webapp.check_init_data("", token) is None)
+    chk("подпись initData: hash не из ASCII — отказ, а не исключение (500 в журнале бота)",
+        webapp.check_init_data(init_data(111).split("&hash=")[0] + "&hash=%D0%BF%D1%80", token) is None
+        and webapp.check_init_data(init_data(111).split("&hash=")[0] + "&hash=\udcff", token) is None
+        and webapp.check_init_data("user=\udcff&auth_date=1&hash=ab", token) is None)
 
     base = f"https://127.0.0.1:{ports[0]}"
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as http:
@@ -1286,6 +1341,12 @@ async def run():
             chk("кроме страницы, скрипта и иконок — ничего", r.status == 404, r.status)
         st, body = await api_("/api/call", {"args": ["status"]})
         chk("панель: общий вызов awg2 api", st == 200 and body["ok"] and body["data"].get("version"), [st, str(body)[:200]])
+        # Неверные типы в теле — отказ или игнор, а не 500 с трейсом
+        st1, _ = await api_("/api/alerts", {"backup_mode": ["x"]})
+        st2, _ = await api_("/api/alerts", {"kind": ["x"], "on": True})
+        st3, _ = await api_("/api/settings", {"sort": ["x"]})
+        st4, _ = await api_("/api/job/status", {"id": "20250101-000000-abcd", "offset": "²"})
+        chk("панель: списки и «²» вместо строк/чисел — не 500", (st1, st2, st3, st4) == (400, 200, 200, 200), [st1, st2, st3, st4])
         st, body = await api_("/api/call", {"args": ["job", "list"]})
         chk("панель: команды вне белого списка — 403", st == 403, [st, body])
         st, body = await api_("/api/call", {"args": "status"})
@@ -1428,6 +1489,20 @@ async def run():
     chk("смена порта перезапускает сервер", webapp.SERVER.running and webapp.SERVER.url.endswith(f":{ports[1]}/")
         and f"Порт Mini App: {ports[1]}" in text, [text[:200], webapp.SERVER.url])
 
+    # Два перезапуска сервера разом (двойной тап «Перезапустить», порт + сертификат): оба
+    # сносили сервер и поднимали свой — второй не мог занять порт, а первый слушал
+    # без хозяина, и stop() его уже не закрывал
+    res = await asyncio.gather(webapp.SERVER.start(BOT), webapp.SERVER.start(BOT), return_exceptions=True)
+    chk("два перезапуска Mini App разом: оба прошли, сервер работает",
+        all(r is None for r in res) and webapp.SERVER.running and not webapp.SERVER.error, [res, webapp.SERVER.error])
+    port = int(webapp.SERVER.url.rsplit(":", 1)[1].strip("/"))
+    await webapp.SERVER.stop()
+    with socket.socket() as s:
+        s.settimeout(2)
+        listening = s.connect_ex(("127.0.0.1", port)) == 0
+    chk("после stop() порт Mini App закрыт (нет бесхозного слушателя)", not listening)
+    await webapp.SERVER.start(BOT)
+
     WEBAPP_REJECT[0] = True
     text, buttons = screen(await press("app"))
     chk("Telegram не принял адрес — понятно, что нужен домен, экран на месте",
@@ -1554,6 +1629,13 @@ async def run():
             return botapi.Result(True, data={"url": URL, "user": "admin", "password": PW})
         if args[1] == "stop":
             WEBST["active"] = False
+        if args[1] == "access":
+            web_calls.append(args[2:])
+            if "300.1.1.1" in args:
+                return botapi.Result(False, rc=1, error="Не адрес или слишком широкая подсеть: 300.1.1.1")
+            WEBST["access"] = args[2]
+            if args[2] == "ip":
+                WEBST["allow"] = list(args[3:])
         return botapi.Result(True)
     botapi.call = web_call
     text, buttons = screen(await press("web:inst"))
@@ -1575,6 +1657,43 @@ async def run():
     chk("остановка: статус и кнопка «Запустить», ссылки «Открыть» нет",
         "Остановлена" in text and ("▶️ Запустить", "web:start") in buttons
         and not any(d == URL for _, d in buttons), [text, buttons])
+
+    WEBST.update(access="all", allow=[], vpn_url="https://10.8.0.1:41234/AbCdEfGh123456/", vpn_nets=["10.8.0.0/24"])
+    text, buttons = screen(await press("web"))
+    chk("веб-панель: строка «Доступ: для всех» и кнопка «🛡 Доступ»",
+        "🛡 Доступ: для всех" in text and ("🛡 Доступ", "web:acc") in buttons, [text, buttons])
+    text, buttons = screen(await press("web:acc"))
+    chk("экран доступа: три режима, текущий отмечен, адрес изнутри VPN",
+        "Сейчас: <b>для всех</b>" in text and "https://10.8.0.1:41234/AbCdEfGh123456/" in text
+        and ("✅ 🌍 Для всех", "web:acc_all") in buttons and ("📍 По адресам", "web:acc_ip") in buttons
+        and ("🔒 Только через VPN", "web:acc_vpn") in buttons, [text, buttons])
+    text, buttons = screen(await press("web:acc_ip"))
+    chk("вопрос про адреса: не обещает IPv6 — панель слушает IPv4", "IPv6 тоже" not in text and "IPv4" in text, text)
+    text, buttons = screen(await say("300.1.1.1, 198.51.100.7"))
+    chk("неверный адрес — ошибка awg2 и тот же вопрос снова", "300.1.1.1" in text and "⚠️" in text
+        and ("✖️ Отмена", "web:acc") in buttons and WEBST["access"] == "all", [text, buttons])
+    text, buttons = screen(await say("198.51.100.7, 203.0.113.0/24;2001:db8::/32"))
+    chk("«По адресам»: список уходит в awg2 по одному, режим отмечен",
+        web_calls[-2] == ("ip", "198.51.100.7", "203.0.113.0/24", "2001:db8::/32")
+        and "✅ Доступ: по адресам и через VPN" in text and "<code>203.0.113.0/24</code>" in text
+        and ("✅ 📍 По адресам", "web:acc_ip") in buttons, [web_calls[-3:], text, buttons])
+    text, buttons = screen(await press("web:acc_vpn"))
+    chk("«Только через VPN» — с подтверждением", "Снаружи порт панели закроется" in text
+        and ("🔒 Закрыть снаружи", "web:acc_vpnok") in buttons and WEBST["access"] == "ip", [text, buttons])
+    text, buttons = screen(await press("web:acc_vpnok"))
+    chk("«Только через VPN» включён; прежние адреса — одной кнопкой",
+        "Сейчас: <b>только через VPN</b>" in text and ("📍 Прежние адреса (3)", "web:acc_old") in buttons, [text, buttons])
+    text, buttons = screen(await press("web:acc_old"))
+    chk("прежние адреса — снова «по адресам» тем же списком",
+        web_calls[-2] == ("ip", "198.51.100.7", "203.0.113.0/24", "2001:db8::/32") and WEBST["access"] == "ip", web_calls[-3:])
+    text, buttons = screen(await press("web:acc_all"))
+    chk("«Для всех» — одним нажатием (бот — путь назад, если адрес сменился)",
+        web_calls[-2] == ("all",) and "Сейчас: <b>для всех</b>" in text, [web_calls[-3:], text])
+    admin = User(id=333, is_bot=False, first_name="Admin")
+    admins.add(333, 111)
+    denied = [alerts(await press(d, admin)) for d in ("web:acc", "web:acc_all", "web:acc_vpnok", "web:acc_ip")]
+    chk("приглашённому админу доступ к панели не менять", all(len(a) == 1 and "только владелец" in a[0] for a in denied), denied)
+    admins.remove(333, removed_by=111)
     botapi.call = real_call_
 
     print("Антисканер")

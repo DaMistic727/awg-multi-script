@@ -8,7 +8,7 @@ _BACKUP_TUNNEL_PATHS=()
 _backup_tunnel_paths() {
   local p
   _BACKUP_TUNNEL_PATHS=()
-  for p in "$XRAY_DIR" "$EXITS_STATE" "$EXITS_PEERS" "$CASCADE_RULES" "$T2S_CONF" "$DNS_PROXY_CONF" \
+  for p in "$XRAY_DIR" "$EXITS_STATE" "$EXITS_PEERS" "$EXITS_PEERS.wgobf" "$CASCADE_RULES" "$T2S_CONF" "$DNS_PROXY_CONF" \
            "$EXITS_DIR"/awg-exit-*.conf; do
     [[ -e "$p" ]] && _BACKUP_TUNNEL_PATHS+=("${p#/}")
   done
@@ -159,7 +159,7 @@ _restore_warp() {  # каталог бэкапа
     # служба выполняет от root, — его Тулза пишет сама, из бэкапа не берём.
     # Состояние «включён» тоже не переносим — туннель включают руками.
     mkdir -p "$WARP_DIR" && chmod 700 "$WARP_DIR"
-    for f in "$WARP_ACCOUNT" "$WARP_PROFILE" "$WARP_PEERS" "$WARP_DIR/account_type"; do
+    for f in "$WARP_ACCOUNT" "$WARP_PROFILE" "$WARP_PEERS" "$WARP_PEERS.wgobf" "$WARP_DIR/account_type"; do
       [[ -f "$src/wgcf/${f##*/}" ]] && install -D -m 600 "$src/wgcf/${f##*/}" "$f"
     done
     rm -f "$WARP_STATE" "$WARP_STATE.failed"
@@ -193,8 +193,7 @@ _restore_tunnels() {  # каталог бэкапа
       [[ -n "$n" ]] && warn "Из конфига Xray бэкапа убрано: $n"
     else warn "Конфиг Xray из бэкапа не разобран — пропущен"; fi
   fi
-  [[ -f "$x$XRAY_PEERS" ]] && install -D -m 600 "$x$XRAY_PEERS" "$XRAY_PEERS"
-  for f in "$EXITS_STATE" "$EXITS_PEERS"; do
+  for f in "$XRAY_PEERS" "$XRAY_PEERS.wgobf" "$EXITS_STATE" "$EXITS_PEERS" "$EXITS_PEERS.wgobf"; do
     [[ -f "$x$f" ]] && install -D -m 600 "$x$f" "$f"
   done
   for f in "$x$EXITS_DIR"/awg-exit-*.conf; do
@@ -313,6 +312,7 @@ backup_restore() {
   port=$(server_port)
   [[ -n "$port" ]] && ufw_allow "$port/udp" AmneziaWG
   expire_install
+  web_vpn_changed
   if awg_up_diag; then ok "awg0 поднят"; else err "awg0 не поднялся — конфиг: $SERVER_CONF"; return 1; fi
   success_box "Восстановлено из $label"
   log_info "восстановление из $label"

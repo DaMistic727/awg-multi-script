@@ -384,6 +384,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   });
   await step("новый клиент", async () => {
     await nav("/add", "input");
+    // Кнопка со случайным именем — одна иконка: подпись для чтения с экрана и всплывающая нужны
+    if (await page.locator("button[aria-label='Случайное имя'][title='Случайное имя']").count() !== 1) throw new Error("кнопка «🎲» без подписи");
     await page.fill("input", "carol");
     await page.selectOption("select", "+1d");
     await shot("06-add");
@@ -976,8 +978,95 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click(".seg button:has-text('NONE')");
     await page.waitForSelector(".toast >> text=NONE");
   });
+  await step("обзор: «нужна перезагрузка» — коротко, убирается крестиком до нового ядра", async () => {
+    const fs = require("fs"), f = `${sandboxRoot}/reboot.txt`, R = "#app:not(.reloading) ";
+    fs.writeFileSync(f, "новое ядро 6.8.0-146 — нужна перезагрузка\n");
+    try {
+      // Сводку бот держит в кэше 5 с — повод появился мимо awg2
+      await page.waitForTimeout(5500);
+      await nav("/", R + "[data-name=alerts] >> text=новое ядро 6.8.0-146 — нужна перезагрузка");
+      await shot("04-reboot-alert");
+      await nav("/server", R + "[data-name=alerts] >> text=новое ядро 6.8.0-146");
+      await page.click("[data-name=alerts] .row:has-text('новое ядро') button[aria-label=Убрать]");
+      await page.waitForSelector("text=новое ядро 6.8.0-146", { state: "detached" });
+      await nav("/", R + "[data-name=routes]");
+      if (await page.$("text=новое ядро 6.8.0-146")) throw new Error("на обзоре убранное замечание вернулось");
+      // Ещё более новое ядро — другой текст: замечание снова на месте
+      fs.writeFileSync(f, "новое ядро 6.8.0-150 — нужна перезагрузка\n");
+      await page.waitForTimeout(5500);
+      await nav("/", R + "[data-name=alerts] >> text=новое ядро 6.8.0-150 — нужна перезагрузка");
+    } finally {
+      fs.unlinkSync(f);
+      await page.evaluate(() => localStorage.removeItem("awg-hidden-alerts"));
+    }
+  });
+  await step("обзор: убранное «обновлены пакеты» забывается, когда повод сменился или пропал, — такой же позже покажется", async () => {
+    const fs = require("fs"), f = `${sandboxRoot}/reboot.txt`, R = "#app:not(.reloading) ", t = "обновлены пакеты — нужна перезагрузка";
+    fs.writeFileSync(f, t + "\n");
+    try {
+      await page.waitForTimeout(5500);
+      await nav("/", R + `[data-name=alerts] >> text=${t}`);
+      await page.click("[data-name=alerts] .row:has-text('обновлены пакеты') button[aria-label=Убрать]");
+      await page.waitForSelector(`text=${t}`, { state: "detached" });
+    } finally { fs.unlinkSync(f); }
+    // Перезагрузились — повод другой (в песочнице — «модуль не загружен»); потом пакеты обновились снова: текст тот же, замечание должно вернуться
+    await page.waitForTimeout(5500);
+    await nav("/", R + "[data-name=routes]");
+    fs.writeFileSync(f, t + "\n");
+    try {
+      await page.waitForTimeout(5500);
+      await nav("/", R + `[data-name=alerts] >> text=${t}`);
+    } finally { fs.unlinkSync(f); await page.evaluate(() => localStorage.removeItem("awg-hidden-alerts")); }
+  });
+  await step("обзор: испорченный список убранных замечаний (не массив) не роняет экран", async () => {
+    await page.evaluate(() => localStorage.setItem("awg-hidden-alerts", "{}"));
+    try {
+      await nav("/", "#app:not(.reloading) [data-name=routes]");
+    } finally { await page.evaluate(() => localStorage.removeItem("awg-hidden-alerts")); }
+  });
+  await step("обфускатор: выход клиентов — напрямую или через туннель, всем и своему", async () => {
+    const R = "#app:not(.reloading) ";
+    await nav("/wgobf", "[data-name=wgobf-route]");
+    // На выбор — только настроенные туннели: работают exit-ноды, WARP не настроен
+    await page.waitForSelector(".rchips button[data-v=direct].on");
+    await page.waitForSelector(".rchips button[data-v=exits]");
+    if (await page.$(".rchips button[data-v=warp]")) throw new Error("WARP не настроен, а на выбор есть");
+    // Профиль WARP есть, но туннель не поднят: выход сохраняется, клиенты пока напрямую
+    const fs = require("fs"), warpConf = `${sandboxRoot}/etc/wireguard/warp0.conf`;
+    fs.writeFileSync(warpConf, "[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n");
+    try {
+      // Сводку обфускатора бот держит в кэше 5 с — профиль WARP появился мимо awg2
+      await page.waitForTimeout(5500);
+      await nav("/wgobf", R + ".rchips button[data-v=warp]");
+      await page.click(".rchips button[data-v=warp]");
+      await page.waitForSelector(".toast >> text=через WARP");
+      await page.waitForSelector(R + ".rchips button[data-v=warp].on");
+      await page.waitForSelector("text=WARP выключен — клиенты пока идут напрямую");
+      await page.waitForSelector("[data-name=ob1] >> text=через WARP");
+      await nav("/wgobf/client/ob1", "[data-name=wgobf-status]");
+      await page.waitForSelector("[data-name=wgobf-status] >> text=WARP выключен — пока напрямую");
+      await nav("/", R + "[data-name=routes] .ptabs");
+      await page.waitForFunction(() => /WARP выключен — пока напрямую/.test(document.querySelector("[data-name=wgobf-routes]").textContent));
+      // Своему клиенту — через работающие exit-ноды: в карточке, на обзоре — «идут через Exit WG»
+      await nav("/wgobf/client/ob1", R + "[data-name=wgobf-client-route] button[data-v=warp].on");
+      await page.waitForSelector("[data-name=wgobf-client-route] >> text=WARP выключен — клиент пока идёт напрямую");
+      await page.click("[data-name=wgobf-client-route] button[data-v=exits]");
+      await page.waitForSelector(".toast >> text=Выход ob1: через exit-ноды");
+      await page.waitForSelector(R + "[data-name=wgobf-client-route] button[data-v=exits].on");
+      await page.waitForSelector("[data-name=wgobf-status] >> text=через exit-ноды");
+      await shot("50-wgobf-client-route");
+      await nav("/", R + "[data-name=routes] .ptabs");
+      await page.waitForFunction(() => /идут через Exit WG/.test(document.querySelector("[data-name=wgobf-routes]").textContent));
+      await nav("/wgobf", R + ".rchips button[data-v=warp].on");
+      await page.click(".rchips button[data-v=direct]");
+      await page.waitForSelector(".toast >> text=напрямую");
+      await page.waitForSelector(R + ".rchips button[data-v=direct].on");
+      await nav("/wgobf/client/ob1", R + "[data-name=wgobf-client-route] button[data-v=direct].on");
+    } finally { fs.unlinkSync(warpConf); }
+  });
   await step("обфускатор: клиент и комплект", async () => {
     await nav("/wgobf/add", "input");
+    if (await page.locator("button[aria-label='Случайное имя'][title='Случайное имя']").count() !== 1) throw new Error("кнопка «🎲» без подписи");
     await page.fill("input", "kn1");
     await page.click("button:has-text('Создать')");
     await page.waitForURL(/#\/wgobf\/client\/kn1$/);

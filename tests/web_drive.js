@@ -78,6 +78,14 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
           /viewBox="0 0 30 20"/.test(decodeURIComponent(document.getElementById("favicon").getAttribute("href") || "")) === on, on);
         if (await isFlag()) throw new Error("по умолчанию во вкладке флаг, а не знак");
         await page.click(".top button[aria-label='Тема']");
+        // Заголовки разделов темы не перекрыты тем, что под ними (кнопки значка вкладки наезжали на свой)
+        await page.waitForSelector("[data-name=tab-icon]");
+        const overlap = await page.evaluate(() => [...document.querySelectorAll(".tsep")].filter((e) => e.offsetParent)
+          .map((e) => { const n = e.nextElementSibling; const a = e.getBoundingClientRect(), b = n ? n.getBoundingClientRect() : null;
+            return { t: e.textContent, gap: b ? Math.round(b.top - a.bottom) : 99 }; }).filter((x) => x.gap < 4));
+        if (overlap.length) throw new Error("заголовок раздела темы перекрыт: " + JSON.stringify(overlap));
+        await page.evaluate(() => document.querySelector("[data-name=tab-icon]").scrollIntoView({ block: "center" }));
+        await page.screenshot({ path: `${out}/${name}-тема-значок.png` });
         await page.click("[data-name=tab-icon] button:has-text('Флаг страны')");
         await waitFlag(true);
         await page.keyboard.press("Escape");
@@ -327,9 +335,57 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
       await page.waitForSelector("text=Последние события");
       await page.screenshot({ path: `${out}/${name}-аккаунт.png`, fullPage: true });
     });
-    await step("выход — снова экран входа, API закрыт", async () => {
+    await step("аккаунт: доступ по адресам — сохранить, неверный адрес, обратно «для всех»", async () => {
+      await page.waitForSelector(".acc-access .seg button.on:has-text('Для всех')");
+      await page.click(".acc-access .seg button:has-text('По адресам')");
+      await page.waitForSelector(".acc-access textarea");
+      // Стенд — тот же компьютер: «с самого сервера», свой адрес добавлять незачем
+      await page.waitForSelector(".acc-access >> text=с самого сервера");
+      if (await page.$(".acc-access button:has-text('Мой адрес')")) throw new Error("кнопка «Мой адрес» для 127.0.0.1");
+      await page.fill(".acc-access textarea", "198.51.100.7, 203.0.113.0/24");
+      await page.click(".acc-access button:has-text('Сохранить доступ')");
+      // Экран перерисован с сервера: список — в виде, в каком его сохранил awg2
+      await page.waitForFunction(() => {
+        const t = document.querySelector(".acc-access textarea");
+        return t && t.value === "198.51.100.7/32, 203.0.113.0/24";
+      }).catch(async () => { throw new Error("после сохранения: " + await page.inputValue(".acc-access textarea")); });
+      await page.waitForSelector(".acc-access .seg button.on:has-text('По адресам')");
+      await page.waitForSelector(".acc-access >> text=Изнутри VPN");
+      await page.screenshot({ path: `${out}/${name}-аккаунт-доступ.png`, fullPage: true });
+      await page.fill(".acc-access textarea", "300.1.1.1");
+      await page.click(".acc-access button:has-text('Сохранить доступ')");
+      await page.waitForSelector(".sheet >> text=300.1.1.1");
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(() => !document.querySelector(".sheet-bg"));
+      await page.click(".acc-access .seg button:has-text('Для всех')");
+      await page.click(".acc-access button:has-text('Сохранить доступ')");
+      await page.waitForFunction(() => !document.querySelector(".acc-access textarea"));
+      await page.waitForSelector("text=доступ изменён");
+    });
+    await step("аккаунт: длинный адрес IPv6 на 320 px — без горизонтальной прокрутки", async () => {
+      const vp = page.viewportSize();
+      await page.setViewportSize({ width: 320, height: vp.height });
+      await page.route(/\/api\/web\/account$/, async (r) => {
+        const rr = await r.fetch(), j = await rr.json();
+        j.access = Object.assign({}, j.access, { mode: "ip", me: "2001:0db8:85a3:0000:0000:8a2e:0370:7334", me_vpn: false, me_self: false });
+        r.fulfill({ response: rr, body: JSON.stringify(j) });
+      });
+      try {
+        await page.goto(u + "#/account");
+        await page.reload({ waitUntil: "domcontentloaded" });
+        await page.waitForSelector(".acc-access button:has-text('Мой адрес')");
+        const over = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+        if (over > 0) throw new Error("страница шире экрана на " + over + " px");
+      } finally { await page.unroute(/\/api\/web\/account$/); await page.setViewportSize(vp); }
+    });
+    await step("выход — снова экран входа, API закрыт; во вкладке снова знак Тулзы, не флаг сервера", async () => {
+      const flagNow = () => page.evaluate(() => /viewBox="0 0 30 20"/.test(decodeURIComponent(document.getElementById("favicon").getAttribute("href") || "")));
+      await page.evaluate(() => { LOOK.tab = "flag"; applyLook(true); });
+      await page.waitForFunction(() => S.status && S.status.country);
+      if (!await flagNow()) throw new Error("перед выходом флаг не показан");
       await page.click("#app button:has-text('Выйти')");
       await page.waitForSelector("form.login");
+      if (await flagNow()) throw new Error("на экране входа во вкладке флаг страны сервера");
       await page.goto(u + "#/clients");
       await page.waitForSelector("form.login");
     });

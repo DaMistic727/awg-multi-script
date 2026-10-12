@@ -516,18 +516,48 @@ with open(os.path.join(ROOT, "etc/xray/state"), "w") as f:
     f.write("active\ntun_mode=tun2socks\n")
 run_and_check("Xray: клиенты из списка в таблицу 201", "XRAY_ROUTING_SCRIPT", "start",
               must=[r"ip route replace default dev xray0 table 201", r"-A POSTROUTING .* -o xray0 -j MASQUERADE"])
+with open(os.path.join(ROOT, "xray.peers.wgobf"), "w") as f:
+    f.write("10.77.1.6|A\n")
+run_and_check("Xray (tun2socks): клиенты обфускатора в таблицу 201, их NAT не трогаем", "XRAY_ROUTING_SCRIPT", "start",
+              must=[r"ip rule add from 10\.77\.1\.6 lookup 201 priority 201"],
+              must_not=[r"-I POSTROUTING 1 -s 10\.77\.1\.0/24 -o xray0 -j RETURN"])
 with open(os.path.join(ROOT, "etc/xray/state"), "w") as f:
     f.write("active\ntun_mode=native\n")
-run_and_check("Xray с inbound tun: без NAT — Xray видит адрес клиента", "XRAY_ROUTING_SCRIPT", "start",
-              must=[r"ip route replace default dev xray0 table 201", r"-D POSTROUTING .* -o xray0 -j MASQUERADE"],
+run_and_check("Xray с inbound tun: без NAT — Xray видит адрес клиента (и клиента обфускатора)", "XRAY_ROUTING_SCRIPT", "start",
+              must=[r"ip route replace default dev xray0 table 201", r"-D POSTROUTING .* -o xray0 -j MASQUERADE",
+                    r"ip rule add from 10\.77\.1\.6 lookup 201 priority 201",
+                    r"-t nat -I POSTROUTING 1 -s 10\.77\.1\.0/24 -o xray0 -j RETURN -m comment --comment awg2-tun-xray0"],
               must_not=[r"-A POSTROUTING .* -o xray0 -j MASQUERADE"])
 os.remove(os.path.join(ROOT, "etc/xray/state"))
-run_and_check("Exit-ноды: ECMP и персональная нода", "EXITS_SCRIPT", "start",
+os.remove(os.path.join(ROOT, "xray.peers.wgobf"))
+with open(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_peers.list.wgobf"), "w") as f:
+    f.write("10.77.1.7|nl\n10.77.1.8\n10.77.1.9|gone\n")
+run_and_check("Exit-ноды: ECMP и персональная нода (и у клиентов обфускатора)", "EXITS_SCRIPT", "start",
               must=[r"nexthop dev awg-exit-de weight 1 nexthop dev awg-exit-nl weight 1",
                     r"ip route replace default dev awg-exit-nl table 211",
                     r"ip rule add from 10\.23\.45\.2 lookup 211 priority 202",
-                    r"ip rule add from 10\.23\.45\.3 lookup 202 priority 202"])
+                    r"ip rule add from 10\.23\.45\.3 lookup 202 priority 202",
+                    r"ip rule add from 10\.77\.1\.7 lookup 211 priority 202",
+                    r"ip rule add from 10\.77\.1\.8 lookup 202 priority 202",
+                    r"ip rule add from 10\.77\.1\.9 lookup 202 priority 202"])
+with open(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_state"), "w") as f:
+    f.write("active\nmode=all\nbalancer=ecmp\nsingle_exit=\n")
+run_and_check("Exit-ноды «все клиенты AWG»: подсеть awg0 целиком, клиенты обфускатора — своим списком", "EXITS_SCRIPT", "start",
+              must=[r"ip rule add from 10\.23\.45\.0/24 lookup 202 priority 202",
+                    r"ip rule add from 10\.77\.1\.7 lookup 211 priority 202",
+                    r"ip rule add from 10\.77\.1\.8 lookup 202 priority 202"],
+              must_not=[r"from 10\.23\.45\.2 lookup"])
+with open(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_state"), "w") as f:
+    f.write("active\nmode=peers\nbalancer=ecmp\nsingle_exit=\n")
+os.remove(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_peers.list.wgobf"))
 run_and_check("Exit-ноды: остановка", "EXITS_SCRIPT", "stop", must_not=[r"-A "])
+# Клиенты WG + обфускатора в WARP: список «.wgobf» рядом со списком WARP читает тот же rt_up
+rc, out, _ = bash('echo 10.23.45.2 > "$WARP_PEERS"; printf "10.77.1.5\\n" > "$WARP_PEERS.wgobf"; echo "$WARP_PEERS"')
+run_and_check("WARP (хук usque): клиенты AWG и обфускатора — в таблицу 200, MSS и для wgobf0", "USQUE_UP_HOOK",
+              must=[r"ip rule add from 10\.23\.45\.2 lookup 200 priority 200",
+                    r"ip rule add from 10\.77\.1\.5 lookup 200 priority 200",
+                    r"-i warp0 -o wgobf0 -p tcp .*TCPMSS"])
+bash('rm -f "$WARP_PEERS" "$WARP_PEERS.wgobf"')
 run_and_check("WG+обфускатор: правила по метке", "WGOBF_FW", "up",
               must=[r"-I INPUT 1 -p udp --dport 40001 ! -i lo -j DROP -m comment --comment awg-wgobf",
                     r"-t nat -A POSTROUTING -s 10\.77\.1\.0/24 ! -o wgobf0 -j MASQUERADE"])
@@ -1548,6 +1578,9 @@ rc, out, _ = bash(KG + 'mod_built_for() { [[ $1 == 6.8.0-100-generic ]]; }; kern
 chk("новое ядро без модуля — в списке, старое — нет", out == "6.8.0-110-generic нет-заголовков\n--\n6.8.0-110-generic (нет заголовков)\n", out)
 rc, out, _ = bash(KG + 'mod_built_for() { true; }; kernel_gap; echo "[$(kernel_gap_line)]"')
 chk("модуль собран под все ядра — пусто", out == "[]\n", out)
+rc, out, _ = bash(KG + 'mod_built_for() { true; }; mod_stale() { false; }; reboot_reason; components_summary')
+chk("новое ядро — коротко: номер без «-generic» и «нужна перезагрузка» (и в шапке меню)",
+    out.splitlines()[0] == "новое ядро 6.8.0-110 — нужна перезагрузка" and "▲ новое ядро 6.8.0-110 — нужна перезагрузка" in out, out)
 rc, out, _ = bash(KG + 'mod_built_for() { [[ $1 == 6.8.0-100-generic ]]; }; components_summary')
 chk("шапка меню предупреждает о ядре без модуля", "6.8.0-110-generic" in out and "Пересобрать" in out, out)
 rc, out, _ = bash(KG + 'mod_built_for() { false; }; mod_loaded() { false; }; components_summary')
@@ -2201,6 +2234,155 @@ chk("выключен — служба при загрузке ничего не
 rc, out, _ = bash(ASPRE + 'antiscan_remove; ls "$ANTISCAN_DIR" "$ANTISCAN_SCRIPT" 2>&1')
 chk("удаление вместе со скриптом: каталог и скрипт убраны", out.count("No such file") == 2, out)
 
+print("\n── Веб-панель: доступ по адресам и только через VPN ──")
+WFW = os.path.join(TMP, "awg2-web-fw")
+WNETS = os.path.join(TMP, "awg-web", "access.nets")
+WACC = ASPRE + WEBAPI + f'WEB_FW_SCRIPT="{WFW}"; WEB_NETS_FILE="{WNETS}"; need_cmds() {{ return 0; }}; '
+for fam in ("iptables", "ip6tables"):
+    open(f"{IPT_RULES}.{fam}", "w").close()
+wport = dict(ln.split("=", 1) for ln in open(WEBC).read().split("\n") if "=" in ln)["WEB_PORT"]
+rc, out, _ = bash(WACC + 'server_net; wgobf_get NET')
+VPN = out.split()
+WRULE = lambda port, st: (f"INPUT ! -i lo -p tcp --dport {port} -m conntrack --ctstate NEW -m set ! --match-set {st} src "
+                          "-m comment --comment awg2-webacl -j DROP")
+webacl = lambda fam=4: [x for x in ipt(fam) if "awg2-webacl" in x]
+wconf = lambda: dict(ln.split("=", 1) for ln in open(WEBC).read().split("\n") if "=" in ln)
+chk("для проверки есть подсети своего VPN (awg0 и обфускатор)", len(VPN) == 2, VPN)
+rc, out, err = bash(WACC + 'web_access_set ip 1.2.3.4 999.1.1.1 0.0.0.0/0')
+chk("не адрес и слишком широкая подсеть — отказ, режим не меняется",
+    rc != 0 and "999.1.1.1" in out + err and "0.0.0.0/0" in out + err and "WEB_ACCESS" not in wconf(), [out, err])
+# «*» в списке адресов — не маска файлов текущего каталога: в ответе то, что ввели, а не имена файлов
+os.makedirs(os.path.join(TMP, "globdir"), exist_ok=True)
+open(os.path.join(TMP, "globdir", "zz-file-1"), "w").close()
+rc, out, err = bash(WACC + f'cd "{TMP}/globdir"; web_access_set ip "*" "1.2.3.?"')
+chk("в списке адресов «*» и «?» не раскрываются в имена файлов; отказ называет введённое",
+    rc != 0 and "zz-file-1" not in out + err and "*, 1.2.3.?" in out + err and "WEB_ACCESS" not in wconf(), [out, err])
+rc, out, err = bash(WACC + 'web_access_set ip "1.2.3.4, 5.6.7.8/16" 2A02:6B8::/32 1.2.3.4')
+c = wconf()
+chk("по адресам: список нормализован (подсеть, регистр IPv6, без дублей), в конфиге режим ip",
+    rc == 0 and c.get("WEB_ACCESS") == "ip" and c.get("WEB_ALLOW") == "1.2.3.4/32,5.6.0.0/16,2a02:6b8::/32", [out, err, c])
+chk("список для самой панели: адреса и свой VPN; права 600",
+    open(WNETS).read().split() == ["1.2.3.4/32", "5.6.0.0/16", "2a02:6b8::/32"] + VPN
+    and os.stat(WNETS).st_mode & 0o777 == 0o600, open(WNETS).read())
+chk("набор IPv4 — адреса и VPN, IPv6 — свой; правило DROP первым в INPUT на порт панели (и для IPv6)",
+    sorted(ipset_set("awg2-web") or []) == sorted(["1.2.3.4/32", "5.6.0.0/16"] + VPN)
+    and ipset_set("awg2-web6") == ["2a02:6b8::/32"] and ipt(4)[:1] == [WRULE(wport, "awg2-web")]
+    and ipt(6)[:1] == [WRULE(wport, "awg2-web6")], [ipset_set("awg2-web"), ipset_set("awg2-web6"), ipt(4), ipt(6)])
+chk("скрипт правила для загрузки и самой панели сгенерирован", os.path.isfile(WFW)
+    and subprocess.run(["bash", "-n", WFW]).returncode == 0, WFW)
+fwu = open(os.path.join(ROOT, "units", "awg2-web-fw.service")).read()
+chk("служба правила при загрузке — раньше UFW и netfilter-persistent (сохранённые правила найдут набор)",
+    "DefaultDependencies=no" in fwu and "Before=network-pre.target ufw.service netfilter-persistent.service" in fwu
+    and f"ExecStart=-{WFW} apply" in fwu and "WantedBy=multi-user.target" in fwu, fwu)
+# Антисканер: оба правила DROP — друг друга не двигают, его проверка «первый» проходит
+rc, out, _ = bash(WACC + 'ipset create awg2-antiscan hash:net; _antiscan_rule_up iptables awg2-antiscan; '
+                  'antiscan_rules_ok && echo AS-OK; web_fw_run apply; antiscan_rules_ok && echo AS-OK2; '
+                  '_antiscan_rule_up iptables awg2-antiscan; antiscan_rules_ok && echo AS-OK3')
+chk("с антисканером: его правило «первое» и до, и после нашего (наш DROP он допускает выше себя); по одному правилу",
+    out.split() == ["AS-OK", "AS-OK2", "AS-OK3"] and len(webacl()) == 1
+    and sum("awg2-antiscan" in x for x in ipt(4)) == 1, [out, ipt(4)])
+rc, out, _ = bash(WACC + f'bash "{WFW}" check; echo "rc=$?"; iptables -D {WRULE(wport, "awg2-web")}; '
+                  f'bash "{WFW}" check; echo "rc=$?"; bash "{WFW}" apply; bash "{WFW}" check; echo "rc=$?"')
+chk("проверка: на месте — 0; правило сняли — 1, apply возвращает", out.split() == ["rc=0", "rc=1", "rc=0"]
+    and len(webacl()) == 1, [out, ipt(4)])
+rc, out, _ = bash(WACC + f'echo "NET=10.99.0.0/24" > "{TMP}/wgobf-state-x"; WGOBF_STATE="{TMP}/wgobf-state-x"; '
+                  f'_web_fw_emit; bash "{WFW}" check; echo "rc=$?"; _web_fw_emit')
+chk("сменилась подсеть VPN (обфускатор поставили заново) — проверка просит обновить список", out.split() == ["rc=1"], out)
+rc, out, _ = bash(WACC + 'web_conf_set WEB_PORT 40123; web_fw_run apply; web_conf_set WEB_PORT ' + wport + '; '
+                  'iptables -S INPUT | grep -c awg2-webacl')
+chk("смена порта — правило на новом порту, старое снято", out.split() == ["1"] and webacl()[0] == WRULE(40123, "awg2-web"),
+    [out, ipt(4)])
+bash(WACC + 'web_fw_run apply')
+rc, out, err = bash(WACC + 'AWG_CLIENT_IP=203.0.113.9 web_access_set ip 198.51.100.0/24')
+rc2, out2, err2 = bash(WACC + 'AWG_CLIENT_IP=198.51.100.7 web_access_set ip 198.51.100.0/24')
+chk("из панели: свой адрес не в списке — отказ (панель закрылась бы сама); в списке — можно",
+    rc != 0 and "203.0.113.9" in out + err and rc2 == 0 and wconf().get("WEB_ALLOW") == "198.51.100.0/24", [out, err, out2, err2])
+vhost = VPN[0].rsplit(".", 1)[0] + ".5"
+rc, out, err = bash(WACC + 'AWG_CLIENT_IP=203.0.113.9 web_access_set vpn')
+rc2, out2, err2 = bash(WACC + f'AWG_CLIENT_IP={vhost} web_access_set vpn')
+chk("только через VPN: зашли не через VPN — отказ с адресом панели изнутри VPN; через VPN — можно",
+    rc != 0 and "не через VPN" in out + err and rc2 == 0 and wconf().get("WEB_ACCESS") == "vpn"
+    and sorted(ipset_set("awg2-web") or []) == sorted(VPN) and ipset_set("awg2-web6") == []
+    and wconf().get("WEB_ALLOW") == "198.51.100.0/24", [out, err, out2, err2, ipset_set("awg2-web")])
+rc, out, err = bash(WACC + 'AWG_CLIENT_IP=127.0.0.1 web_access_set vpn && AWG_CLIENT_IP=::1 web_access_set vpn')
+chk("с самого сервера (127.0.0.1, ::1) — можно любой режим: так панель открывается всегда", rc == 0, [out, err])
+WGC = os.path.join(TMP, "wgobf0-only.conf")
+with open(WGC, "w") as f:
+    f.write("[Interface]\nAddress = 10.77.0.1/24\nPrivateKey = X\n")
+rc, out, _ = bash(WACC + f'SERVER_CONF="{TMP}/no-awg0.conf"; WGOBF_WG_CONF="{WGC}"; web_vpn_url')
+chk("адрес изнутри VPN без AWG — адрес wgobf0", out.strip() == f"https://10.77.0.1:{wport}/{wconf()['WEB_PATH']}/", out)
+rc, out, _ = bash(WACC + "api_main web status")
+st = json.loads(out)["data"]
+chk("api web status: доступ, список (хранится и в режиме VPN), подсети VPN, адрес из VPN",
+    st.get("access") == "vpn" and st.get("allow") == ["198.51.100.0/24"] and st.get("vpn_nets") == VPN
+    and st.get("vpn_url", "").startswith("https://" + VPN[0].rsplit(".", 1)[0] + ".1:" + wport + "/"), st)
+rc, out, _ = bash(WACC + "api_main web access all")
+chk("для всех: правила и наборы сняты, файл списка убран, список адресов сохранён",
+    json.loads(out).get("ok") and not webacl(4) and not webacl(6) and ipset_set("awg2-web") is None
+    and ipset_set("awg2-web6") is None and not os.path.exists(WNETS) and wconf().get("WEB_ALLOW") == "198.51.100.0/24",
+    [out, ipt(4), ipt(6)])
+# Скрипт сам по себе (загрузка, сама панель): без функций awg2
+with open(WEBC, "a") as f:
+    f.write("WEB_ACCESS=vpn\n")
+rc, out, err = bash(ASPRE + f'bash "{WFW}" apply; echo "rc=$?"')
+chk("скрипт без awg2 (ExecStartPre при загрузке): ставит правило по конфигу", out.split()[-1:] == ["rc=0"]
+    and webacl()[:1] == [WRULE(wport, "awg2-web")], [out, err, ipt(4)])
+rc, out, _ = bash(WACC + 'web_write_unit; cat "' + ROOT + '/units/awg-web.service"')
+chk("юнит панели: правило ставится до старта (с «-»: не встало — панель всё равно стартует), путь скрипта панели",
+    f"ExecStartPre=-{WFW} apply" in out and f"AWG_WEB_FW={WFW}" in out and f"AWG_WEB_NETS={WNETS}" in out, out)
+rc, out, _ = bash(WACC + 'unset SSH_CONNECTION; web_access_menu; web_conf_get WEB_ACCESS; web_conf_get WEB_ALLOW',
+                  stdin="2\n198.51.100.0/24, 192.0.2.7\n")
+rc2, out2, _ = bash(WACC + 'web_access_menu; web_conf_get WEB_ACCESS; do_web_menu', stdin="1\n0\n")
+chk("меню awg2: «Только с моих адресов» — список через запятую; «Для всех»; строка «Доступ» в меню панели",
+    out.split()[-2:] == ["ip", "198.51.100.0/24,192.0.2.7/32"] and "Только через VPN" in out
+    and "\nall\n" in out2 and any("a)" in ln and "Доступ" in ln and "для всех" in ln for ln in out2.splitlines()), [out[-600:], out2[-900:]])
+rc, out, _ = bash(WACC + 'web_access_set vpn >/dev/null; command() { [[ "$*" == "-v ipset" ]] && return 1; builtin command "$@"; }; '
+                  'web_fw_run check; echo "rc=$?"; echo 192.0.2.0/24 >> "$WEB_NETS_FILE"; web_fw_run check; echo "rc=$?"; '
+                  'unset -f command; web_access_set all >/dev/null')
+chk("без ipset проверка сверяет только список панели — не дёргает apply каждые 5 минут", out.split() == ["rc=0", "rc=1"], out)
+rc, out, _ = bash(WACC + 'web_fw_run down; iptables -S INPUT | grep -c awg2-webacl; ls "$WEB_NETS_FILE" 2>&1 | grep -c "No such"')
+chk("down — всё снято", out.split() == ["0", "1"], out)
+# Apply из awg2 и из сторожа панели разом — по очереди (иначе два DROP): второй ждёт замка первого
+bash(WACC + 'web_access_set vpn >/dev/null')
+order = os.path.join(TMP, "webfw-order")
+rc, out, _ = bash(WACC + f': > "{order}"; flock "$WEB_NETS_FILE.lock" -c \'sleep 1.5; echo released >> "{order}"\' & '
+                  f'sleep 0.3; bash "{WFW}" apply; echo applied >> "{order}"; wait')
+chk("правило панели: apply ждёт замка параллельного apply (скрипт панели и awg2 — один замок)",
+    open(order).read().split() == ["released", "applied"] and len(webacl()) == 1, [open(order).read(), ipt(4)])
+# Сменился VPN — список и правило панели сразу, не через 5 минут; последний VPN удалён при «только через VPN» —
+# режим «по адресам» по сохранённому списку (иначе панель закрылась бы всем), списка нет — «для всех»
+WOB = os.path.join(TMP, "wgobf-copy")
+shutil.rmtree(WOB, ignore_errors=True)
+os.makedirs(os.path.join(WOB, "etc"))
+shutil.copy(os.path.join(ROOT, "etc/awg-wgobf/state"), os.path.join(WOB, "etc/state"))
+open(os.path.join(WOB, "wgobf0.conf"), "w").write("[Interface]\nAddress = 10.77.0.1/24\n")
+WOBPRE = (f'WGOBF_DIR="{WOB}/etc"; WGOBF_STATE="{WOB}/etc/state"; WGOBF_WG_CONF="{WOB}/wgobf0.conf"; '
+          f'WGOBF_CLIENTS="{WOB}/clients"; WGOBF_LIB="{WOB}/lib"; WGOBF_BIN="{WOB}/lib/bin"; BACKUP_DIR="{WOB}/bak"; '
+          '_wgobf_routes_clear() { :; }; ')
+bash(WACC + 'web_access_set ip 198.51.100.0/24 >/dev/null')
+rc, out, err = bash(WACC + WOBPRE + 'wgobf_remove quiet; web_conf_get WEB_ACCESS')
+chk("обфускатор удалён (доступ по адресам) — его подсеть из списка панели и набора убрана сразу",
+    out.split()[-1:] == ["ip"] and open(WNETS).read().split() == ["198.51.100.0/24", VPN[0]]
+    and sorted(ipset_set("awg2-web") or []) == sorted(["198.51.100.0/24", VPN[0]]), [out, err, open(WNETS).read()])
+SRV = os.path.join(TMP, "srv-copy")
+shutil.rmtree(SRV, ignore_errors=True)
+os.makedirs(SRV)
+shutil.copy(os.path.join(ROOT, "etc/amnezia/amneziawg/awg0.conf"), os.path.join(SRV, "awg0.conf"))
+SRVPRE = (f'SERVER_CONF="{SRV}/awg0.conf"; CLIENT_DIR="{SRV}/cl"; TRAFFIC_DB="{SRV}/t.json"; WARP_PEERS="{SRV}/w"; '
+          f'XRAY_PEERS="{SRV}/x"; EXITS_PEERS="{SRV}/e"; EXPIRE_STATE_DIR="{SRV}/exp"; WGOBF_STATE="{WOB}/none"; '
+          'auto_backup() { :; }; tunnels_panic_reset() { :; }; ')
+bash(WACC + SRVPRE + 'web_access_set vpn >/dev/null')
+rc, out, err = bash(WACC + SRVPRE + 'server_reset; web_conf_get WEB_ACCESS; web_conf_get WEB_ALLOW')
+chk("сервер сброшен, других VPN нет, доступ «только через VPN» — режим тот же, снаружи закрыта, с предупреждением",
+    out.split()[-2:] == ["vpn", "198.51.100.0/24"] and "снаружи она закрыта" in out
+    and open(WNETS).read().split() == [] and ipset_set("awg2-web") == [] and len(webacl()) == 1,
+    [out, err, open(WNETS).read()])
+rc, out, err = bash(WACC + 'web_vpn_changed; web_conf_get WEB_ACCESS')
+chk("VPN снова есть (новый сервер) — «только через VPN» открывается через него сам, без предупреждения",
+    out.split()[-1:] == ["vpn"] and "закрыта" not in out and open(WNETS).read().split() == VPN
+    and sorted(ipset_set("awg2-web") or []) == sorted(VPN) and len(webacl()) == 1, [out, err, open(WNETS).read()])
+bash(WACC + 'web_conf_set WEB_ACCESS all; web_fw_run apply')
+
 print("\n── WG + обфускатор: клиенты с трафиком ──")
 os.makedirs(os.path.join(ROOT, "etc/awg-wgobf"), exist_ok=True)
 os.makedirs(os.path.join(ROOT, "etc/wireguard"), exist_ok=True)
@@ -2217,6 +2399,192 @@ rows = {x["name"]: x for x in r.get("data") or []}
 chk("клиенты обфускатора: рукопожатие и трафик с запуска; у второго (нет в dump) — пусто, не цифры соседа",
     r.get("ok") and rows.get("wa", {}).get("rx") == 5000 and rows["wa"].get("tx") == 7000 and 30 <= rows["wa"].get("ago", -1) <= 120
     and rows.get("wb", {}).get("rx") == 0 and rows["wb"].get("ago") is None, r)
+print("\n── WG + обфускатор: выход через WARP ──")
+r = api("wgobf", "route", "all", "warp")
+chk("выход через WARP без настроенного WARP — отказ с подсказкой", r.get("ok") is False and "WARP не настроен" in r.get("error", ""), r)
+with open(os.path.join(ROOT, "etc/wireguard/warp0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n[Peer]\nPublicKey = Q\nEndpoint = 162.159.192.1:2408\n")
+reset_calls()
+r = api("wgobf", "route", "all", "warp")
+wl = lambda: bash('cat "$WARP_PEERS.wgobf" 2>/dev/null')[1].split()
+st = (api("wgobf", "status").get("data") or {})
+rows = {x["name"]: x for x in api("wgobf", "clients").get("data") or []}
+chk("все клиенты обфускатора — в WARP: список .wgobf, выход в status и clients, WARP выключен — подсказка",
+    r.get("ok") and wl() == ["10.66.66.2", "10.66.66.3"] and st.get("route") == "warp" and st.get("warp") == "off"
+    and rows.get("wa", {}).get("route") == "warp" and rows.get("wb", {}).get("route") == "warp"
+    and "WARP сейчас выключен" in r.get("_err", "") + json.dumps(r, ensure_ascii=False), [r, wl(), st, rows])
+r = api("wgobf", "route", "wb", "direct")
+rows = {x["name"]: x for x in api("wgobf", "clients").get("data") or []}
+chk("один клиент — напрямую: из списка WARP и его правила сняты", r.get("ok") and wl() == ["10.66.66.2"]
+    and rows["wb"]["route"] == "direct" and "ip rule del from 10.66.66.3" in calls(), [r, wl()])
+r = api("wgobf", "route", "nobody", "warp")
+r2 = api("wgobf", "route", "wa", "tor")
+r3 = api("wgobf", "route", "wa", "warp:x")
+r4 = api("wgobf", "route", "wa", "xray:A\n10.66.66.9|B")
+r5 = api("wgobf", "route", "wa", "exits:../x")
+chk("нет клиента и неизвестный выход — отказ; перевод строки и чужие символы в выходе — тоже",
+    all(x.get("ok") is False for x in (r, r2, r3, r4, r5)) and wl() == ["10.66.66.2"], [r, r2, r3, r4, r5, wl()])
+rc, out, _ = bash('peers_all "$WARP_PEERS"; peers_sync "$WARP_PEERS"; : > "$WARP_PEERS"; cat "$WARP_PEERS.wgobf"')
+chk("«все клиенты AWG» и синхронизация списка WARP клиентов обфускатора не трогают", out.split() == ["10.66.66.2"], out)
+rc, out, _ = bash('_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; wgobf_add_client wc >/dev/null 2>&1; cat "$WARP_PEERS.wgobf"; '
+                  'wgobf_delete_client wa >/dev/null 2>&1; echo "--"; cat "$WARP_PEERS.wgobf"')
+chk("новый клиент — туда же, куда все (WARP); удалённый — из списка", out.split() == ["10.66.66.2", "10.66.66.4", "--", "10.66.66.4"], out)
+rc, out, _ = bash('_wgobf_routes_clear; [[ -e "$WARP_PEERS.wgobf" ]] && echo LEFT || echo GONE')
+chk("удаление или новая установка обфускатора — список выходов прежних клиентов убран", out.strip() == "GONE", out)
+os.remove(os.path.join(ROOT, "etc/wireguard/warp0.conf"))
+with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = X\n\n[Peer]\n# client=wa\nPublicKey = WAPUB=\nAllowedIPs = 10.66.66.2/32\n\n"
+            "[Peer]\n# client=wb\nPublicKey = WBPUB=\nAllowedIPs = 10.66.66.3/32\n")
+
+print("\n── WG + обфускатор: AppArmor wg-quick (Ubuntu 25.10+) ──")
+with open(os.path.join(BIN, "apparmor_parser"), "w") as f:
+    f.write('#!/usr/bin/env bash\necho "apparmor_parser $*" >> "$CALLS"\nexit 0\n')
+os.chmod(os.path.join(BIN, "apparmor_parser"), 0o755)
+AA = os.path.join(ROOT, "etc/apparmor.d")
+AAL = os.path.join(AA, "local/wg-quick")
+reset_calls()
+rc, out, _ = bash('WGOBF_FW=/usr/local/lib/awg2/wgobf-fw.sh; _wgobf_apparmor; [[ -e "$WGOBF_AA_DIR/local/wg-quick" ]] && echo MADE || echo NONE')
+chk("профиля wg-quick нет — AppArmor не трогаем", out.strip().endswith("NONE") and "apparmor_parser" not in calls(), [out, calls()])
+os.makedirs(os.path.join(AA, "local"), exist_ok=True)
+with open(os.path.join(AA, "wg-quick"), "w") as f:
+    f.write("profile wg-quick /usr/bin/wg-quick {\n  include if exists <local/wg-quick>\n}\n")
+with open(AAL, "w") as f:
+    f.write("# своё\nfile r /etc/my-hook.conf,\n")
+reset_calls()
+rc, out, _ = bash('WGOBF_FW=/usr/local/lib/awg2/wgobf-fw.sh; _wgobf_apparmor; _wgobf_apparmor')
+loc = open(AAL).read()
+chk("профиль wg-quick есть — скрипт правил wgobf0 разрешён в local/wg-quick, своё на месте, профиль перечитан один раз",
+    "file PUx /usr/local/lib/awg2/wgobf-fw.sh," in loc and loc.startswith("# своё\nfile r /etc/my-hook.conf,\n")
+    and loc.count("awg2-wgobf: begin") == 1 and calls().count("apparmor_parser -r") == 1
+    and os.path.join(AA, "wg-quick") in calls(), [loc, calls()])
+reset_calls()
+rc, out, _ = bash('_wgobf_apparmor drop')
+loc = open(AAL).read()
+chk("удаление обфускатора — свой блок убран, чужие строки остались, профиль перечитан",
+    loc == "# своё\nfile r /etc/my-hook.conf,\n" and calls().count("apparmor_parser -r") == 1, [loc, calls()])
+with open(os.path.join(AA, "wg-quick"), "w") as f:
+    f.write("profile wg-quick /usr/bin/wg-quick {\n}\n")
+os.remove(AAL)
+rc, out, err = bash('_wgobf_apparmor')
+chk("профиль без local/wg-quick — предупреждение, файл не создаём", not os.path.exists(AAL) and "local/wg-quick" in out + err, [out, err])
+os.remove(os.path.join(AA, "wg-quick"))
+
+print("\n── WG + обфускатор: свой маршрут клиента — Xray и exit-ноды ──")
+XCONF = os.path.join(ROOT, "etc/xray/config.json")
+xconf_was = open(XCONF).read() if os.path.exists(XCONF) else None
+fake_xray(tun=True)
+os.makedirs(os.path.dirname(XCONF), exist_ok=True)
+with open(XCONF, "w") as f:
+    json.dump({"inbounds": [{"protocol": "tun", "tag": "tun-in", "settings": {"name": "xray0"}}],
+               "outbounds": [{"protocol": "vless", "tag": "A"}, {"protocol": "vless", "tag": "B"},
+                             {"protocol": "freedom", "tag": "direct"}],
+               "routing": {"rules": [{"type": "field", "inboundTag": ["tun-in"], "outboundTag": "A"}]}}, f)
+for n in ("p1", "p2"):
+    open(os.path.join(ROOT, f"etc/amnezia/amneziawg/awg-exit-{n}.conf"), "w").close()
+st = api("wgobf", "status").get("data") or {}
+chk("api wgobf status: туннели на выбор — Xray с выходами (умеет tun), exit-ноды",
+    st.get("xray") in ("off", "up") and st.get("xray_tags") == ["A", "B"] and st.get("exits") in ("off", "up")
+    and {"p1", "p2"} <= set(st.get("exit_nodes") or []), st)
+# Xray поднят в режиме tun: свой выход клиента — правило в конфиге Xray и перезапуск
+WSTUB = 'xray_restart() { echo XRAY-RESTART; }; exits_reapply() { echo EXITS-REAPPLY; }; '
+with open(LINKS, "w") as f:
+    f.write("xray0\n")
+with open(os.path.join(ROOT, "etc/xray/state"), "w") as f:
+    f.write("active\ntun_mode=native\n")
+reset_calls()
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wa xray:A; echo "--"; cat "$XRAY_PEERS.wgobf"')
+xr = [r for r in json.load(open(XCONF))["routing"]["rules"] if r.get("source")]
+chk("клиент обфускатора → свой выход Xray: список, правило по адресу в конфиге, перезапуск, без NAT в xray0",
+    rc == 0 and "XRAY-RESTART" in out and out.split("--")[1].split() == ["10.66.66.2|A"]
+    and any(r.get("source") == ["10.66.66.2"] and r.get("outboundTag") == "A" for r in xr)
+    and "ip rule add from 10.66.66.2 lookup 201 priority 201" in calls()
+    and "-t nat -I POSTROUTING 1 -s 10.66.66.0/24 -o xray0 -j RETURN" in calls() and "EXITS-REAPPLY" not in out,
+    [out, xr, calls()])
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wa xray:A; echo "--"; wgobf_route_set wa xray; echo "--"; wgobf_route_set wa xray')
+parts = out.split("--")
+chk("тот же выход — без перезапуска; на выход по умолчанию — перезапуск один раз, дальше без него",
+    rc == 0 and len(parts) == 3 and "XRAY-RESTART" not in parts[0] and "XRAY-RESTART" in parts[1]
+    and "XRAY-RESTART" not in parts[2], out)
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wb exits:p2; echo "--"; cat "$EXITS_PEERS.wgobf"; echo "--"; wgobf_route_set wb exits:p2')
+parts = out.split("--")
+chk("клиент обфускатора → своя exit-нода: список, маршрутизация нод перезапускается, повтор — без перезапуска",
+    rc == 0 and "EXITS-REAPPLY" in parts[0] and parts[1].split() == ["10.66.66.3|p2"] and "EXITS-REAPPLY" not in parts[2], out)
+# Exit-ноды работают: тот же выход повторно не снимает правило клиента (список тот же — перезапуска нод
+# нет, и вернуть его было бы некому), потерянное правило возвращается без перезапуска, стоящее — не дублируется
+links_was, active_was = open(LINKS).read(), open(ACTIVE).read()
+with open(LINKS, "a") as f:
+    f.write("awg-exit-p2\n")
+with open(ACTIVE, "a") as f:
+    f.write("awg-exits-routing.service\n")
+reset_calls()
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wb exits:p2 2>&1')
+chk("exit-нода выбрана повторно — правило клиента не снимается и на месте, без перезапуска нод",
+    rc == 0 and "EXITS-REAPPLY" not in out and "ip rule del from 10.66.66.3" not in calls()
+    and re.search(r"ip rule add from 10\.66\.66\.3 lookup 21\d priority 202", calls()), [out, calls()])
+reset_calls()
+rc, out, _ = bash(WSTUB + '_wgobf_route_refresh "$(_xray_outs)" "$(sort "$EXITS_PEERS.wgobf")"')
+chk("правило клиента exit-ноды потеряно — возвращается в таблицу его ноды, без перезапуска нод",
+    "EXITS-REAPPLY" not in out and re.search(r"ip rule add from 10\.66\.66\.3 lookup 21\d priority 202", calls()), [out, calls()])
+reset_calls()
+rc, out, _ = bash(WSTUB + 'ip() { if [[ "$1 $2" == "rule show" ]]; then printf "202:\\tfrom 10.66.66.3 lookup 211\\n"; '
+                  'else command ip "$@"; fi; }; _wgobf_route_refresh "$(_xray_outs)" "$(sort "$EXITS_PEERS.wgobf")"')
+chk("правило клиента exit-ноды на месте — второе не ставится", "from 10.66.66.3" not in calls(), calls())
+open(LINKS, "w").write(links_was)
+reset_calls()
+rc, out, _ = bash(WSTUB + '_wgobf_route_refresh "$(_xray_outs)" "$(sort "$EXITS_PEERS.wgobf")"')
+chk("нода клиента лежит — правило на общий выход exit-нод, а не в пустоту",
+    "ip rule add from 10.66.66.3 lookup 202 priority 202" in calls(), calls())
+open(ACTIVE, "w").write(active_was)
+reset_calls()
+rc, out, _ = bash(WSTUB + '_wgobf_route_refresh "$(_xray_outs)" "$(sort "$EXITS_PEERS.wgobf")"')
+chk("exit-ноды выключены — правил клиенту exit-нод не ставим", "ip rule add from 10.66.66.3" not in calls(), calls())
+rc, out, _ = bash(WSTUB + 'SERVER_CONF="$SERVER_CONF.none"; wgobf_route_set wb exits 2>&1; echo "rc=$?"; '
+                  'wgobf_route_of 10.66.66.3; wgobf_route_set wb direct >/dev/null 2>&1; echo "rc=$?"; '
+                  'echo 0 | _wgobf_route_pick 2>&1')
+chk("сервера AWG нет (только обфускатор) — выход в туннель не принимается с понятной причиной, напрямую — можно",
+    "сервером AWG" in out.split("rc=1")[0] and "rc=1\nexits:p2\nrc=0" in out
+    and "exit-нод" not in out.split("rc=0")[1], out)
+bash(WSTUB + 'wgobf_route_set wb exits:p2 >/dev/null 2>&1')
+r1 = api("wgobf", "route", "wb", "exits:zz")
+r2 = api("wgobf", "route", "wb", "xray:Q")
+rows = {x["name"]: x for x in api("wgobf", "clients").get("data") or []}
+chk("нет ноды или выхода Xray — отказ; в clients — маршрут каждого",
+    r1.get("ok") is False and "Ноды zz нет" in r1.get("error", "") and r2.get("ok") is False
+    and "Выхода Xray Q нет" in r2.get("error", "") and rows.get("wa", {}).get("route") == "xray"
+    and rows.get("wb", {}).get("route") == "exits:p2", [r1, r2, rows])
+rc, out, _ = bash('_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; wgobf_add_client all >/dev/null 2>&1; echo "rc=$?"; wgobf_clients | grep -cx all || true')
+chk("клиент обфускатора с именем all не создаётся: в «wgobf route» так зовутся все клиенты", out.split() == ["rc=1", "0"], out)
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wa xray:B >/dev/null; _xray_peers_untag B; cat "$XRAY_PEERS.wgobf"')
+chk("выход Xray удалён — клиент обфускатора на выходе по умолчанию",
+    len(out.split()) == 2 and int(out.split()[0]) >= 1 and out.split()[1] == "10.66.66.2", out)
+rc, out, _ = bash(WSTUB + 'exits_node_del p2 >/dev/null; : > "$EXITS_DIR/awg-exit-p3.conf"; cat "$EXITS_PEERS.wgobf"')
+chk("нода удалена — клиент обфускатора на общем выходе", out.split() == ["10.66.66.3"], out)
+rc, out, _ = bash(WSTUB + '_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; '
+                  'wgobf_route_set all exits:p1 >/dev/null; wgobf_get ROUTE; wgobf_add_client wc >/dev/null 2>&1; '
+                  'rm -f "$EXITS_DIR/awg-exit-p1.conf"; wgobf_add_client wd >/dev/null 2>&1; cat "$EXITS_PEERS.wgobf"; '
+                  'echo "--"; cat "$XRAY_PEERS.wgobf"; echo "--"; wgobf_route_of 10.66.66.5')
+chk("новые клиенты — за всеми (exits:p1); ноды уже нет — общий выход exit-нод; в одном списке за раз",
+    out.split() == ["exits:p1", "10.66.66.2|p1", "10.66.66.3|p1", "10.66.66.4|p1", "10.66.66.5", "--", "--", "exits"], out)
+rc, out, _ = bash('_backup_tunnel_paths; printf "%s\n" "${_BACKUP_TUNNEL_PATHS[@]}"')
+chk("бэкап туннелей — со списком exit-нод клиентов обфускатора", "exits_peers.list.wgobf" in out, out)
+rc, out, _ = bash(WSTUB + '_wgobf_routes_clear; ls "$EXITS_PEERS.wgobf" "$XRAY_PEERS.wgobf" 2>&1 | grep -c "No such"')
+chk("обфускатор удалён — списки Xray и exit-нод его клиентов убраны, маршрутизация нод перезапущена",
+    out.split() == ["EXITS-REAPPLY", "2"], out)
+os.remove(os.path.join(ROOT, "etc/xray/state"))
+open(LINKS, "w").close()
+for n in ("p1", "p2", "p3"):
+    if os.path.exists(os.path.join(ROOT, f"etc/amnezia/amneziawg/awg-exit-{n}.conf")):
+        os.remove(os.path.join(ROOT, f"etc/amnezia/amneziawg/awg-exit-{n}.conf"))
+if xconf_was is None:
+    os.remove(XCONF)
+else:
+    with open(XCONF, "w") as f:
+        f.write(xconf_was)
+with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = X\n\n[Peer]\n# client=wa\nPublicKey = WAPUB=\nAllowedIPs = 10.66.66.2/32\n\n"
+            "[Peer]\n# client=wb\nPublicKey = WBPUB=\nAllowedIPs = 10.66.66.3/32\n")
+bash('wgobf_set ROUTE direct')
+
 r = api("traffic", "now")
 d = r.get("data") or {}
 chk("api traffic now — клиенты обфускатора отдельно (wpeers): живая скорость считает и их",
