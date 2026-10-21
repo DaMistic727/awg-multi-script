@@ -290,6 +290,11 @@ const meter = (used, limit) => {
 };
 const PERIOD = { month: "за месяц", total: "всего" };
 const limitText = (c) => `${fmtBytes(c.used)} из ${fmtBytes(c.limit)} ${PERIOD[c.period] || ""}`;
+// Скорость клиента: своя или замедление по лимиту (действует меньшая); пусто — без ограничения
+const speedNow = (c) => (c.slowed && c.limit_slow && !(c.speed && c.speed < c.limit_slow) ? c.limit_slow : c.speed || 0);
+const speedText = (c) => (!speedNow(c) ? "" : speedNow(c) === c.speed ? `${c.speed} Мбит/с` : `🐢 ${c.limit_slow} Мбит/с — лимит исчерпан`);
+const SPEEDS = [5, 10, 20, 50, 100];
+const SLOW_MODES = [["block", "🚫 Блокировать"], ["1", "🐢 1 Мбит/с"], ["2", "🐢 2 Мбит/с"], ["5", "🐢 5 Мбит/с"]];
 
 // ── Вид: иконки, тема, шапка, общие детали ────────────────
 function icon(name) {
@@ -309,7 +314,7 @@ const EMOJI_ICON = {
   "📅": "calendar-clock", "♾": "infinity", "🚪": "door-open", "☁": "cloud", "🛰": "satellite", "🧦": "waypoints",
   "🔐": "lock-keyhole", "🧪": "flask-conical", "🖥": "server", "🛡": "shield", "📁": "folder", "🗜": "file-archive",
   "◀": "arrow-left", "✅": "circle-check", "❌": "circle-x", "✖": "x", "🔃": "arrow-down-up", "📂": "folder",
-  "👮": "user", "🎨": "palette", "📶": "gauge", "📊": "chart-column", "📈": "chart-column", "🕒": "clock", "🎛": "sliders-horizontal", "↩": "undo-2", "💬": "message-square-text", "📱": "smartphone", "🔗": "share-2", "🙋": "user-plus", "🧯": "eraser",
+  "👮": "user", "🎨": "palette", "📶": "gauge", "🚀": "zap", "🐢": "timer", "🚫": "circle-x", "📊": "chart-column", "📈": "chart-column", "🕒": "clock", "🎛": "sliders-horizontal", "↩": "undo-2", "💬": "message-square-text", "📱": "smartphone", "🔗": "share-2", "🙋": "user-plus", "🧯": "eraser",
 };
 // \p{…} старый движок не знает (вся панель падала на этой строке) — там
 // эмодзи узнаётся по суррогатной паре или блоку символов
@@ -356,7 +361,10 @@ const setPref = (k, v) => { try { localStorage.setItem("awg-" + k, v); } catch (
 
 // ── Вид: тема, акцент, фон, скругление, масштаб — панель «Тема» ──
 // Хранится в этом браузере; «Авто» — как тема Telegram (в Mini App) или системы
-const LOOK_DEF = { mode: "auto", hue: null, sat: 80, bgHue: null, tint: 22, rb: 16, zoom: 100, grid: false, tab: "logo" };
+// skin — стиль: «Классика» (toolza, по умолчанию: нижняя панель разделов) или «Карточки»
+// (cards: шрифт Plex, меню в шапке, клиенты карточками). Экран туннелей — общий для обоих
+const LOOK_DEF = { mode: "auto", hue: null, sat: 80, bgHue: null, tint: 22, rb: 16, zoom: 100, grid: false, tab: "logo", skin: "toolza" };
+const SKIN_RB = { cards: 20, toolza: 16 };
 const ZOOM_MIN = 75, ZOOM_MAX = 130;
 function loadLook() {
   let v = null;
@@ -367,12 +375,16 @@ function loadLook() {
   L.zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Number(L.zoom) || 100));
   if (!["auto", "dark", "light"].includes(L.mode)) L.mode = "auto";
   if (!["logo", "flag"].includes(L.tab)) L.tab = "logo";
+  if (!SKIN_RB[L.skin]) L.skin = LOOK_DEF.skin;
+  // Скругление не выбирали (или осталось прежним по умолчанию) — своё у стиля
+  if (v.rb == null || (v.skin == null && v.rb === SKIN_RB.toolza)) L.rb = SKIN_RB[L.skin];
   return L;
 }
 let LOOK = loadLook();
 const autoTheme = () => (WEB ? (window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
   : tg && tg.colorScheme === "light" ? "light" : "dark");
 const themeNow = () => (LOOK.mode === "dark" || LOOK.mode === "light" ? LOOK.mode : autoTheme());
+const cardsSkin = () => LOOK.skin === "cards";
 const BG_VARS = ["--bg", "--bg2", "--panel", "--panel2", "--hover", "--line", "--line2"];
 const rgbHex = (rgb) => "#" + (rgb.match(/\d+/g) || [0, 0, 0]).slice(0, 3).map((x) => (+x).toString(16).padStart(2, "0")).join("");
 
@@ -436,6 +448,7 @@ function favRefresh() {
 function applyLook(save = false) {
   const el = document.documentElement, st = el.style, mode = themeNow(), dark = mode === "dark";
   el.dataset.theme = mode;
+  el.dataset.skin = LOOK.skin;
   ["--acc", "--acc-ink", "--acc-soft", ...BG_VARS].forEach((p) => st.removeProperty(p));
   if (LOOK.hue != null) {
     const hh = LOOK.hue, sat = LOOK.sat, L = dark ? 58 : 32;
@@ -461,6 +474,19 @@ function applyLook(save = false) {
   } catch (_) { /* старый Telegram: цвета шапки не меняются */ }
 }
 applyLook();
+// Шрифт стиля «Карточки» грузится после первой отрисовки: знак-название в ленте
+// меряет буквы — перемерить, когда шрифт пришёл (в старом движке FontFaceSet нет)
+if (document.fonts && "onloadingdone" in document.fonts) {
+  let fontT = 0;
+  document.fonts.onloadingdone = () => { clearTimeout(fontT); fontT = setTimeout(() => { try { drawTop(); } catch (_) { /* ещё не готово */ } }, 50); };
+}
+// Сменить стиль: скругление по умолчанию — своё у каждого; свои настройки остаются
+function setSkin(k) {
+  if (!SKIN_RB[k] || LOOK.skin === k) return;
+  if (LOOK.rb === SKIN_RB[LOOK.skin]) LOOK.rb = SKIN_RB[k];
+  LOOK.skin = k;
+  applyLook(true); drawTop(); render();
+}
 
 const SWATCH = [["Toolza", 156, 80], ["Лайм", 78, 85], ["Океан", 198, 80], ["Индиго", 232, 75], ["Фиалка", 268, 70],
   ["Роза", 336, 75], ["Закат", 16, 85], ["Янтарь", 40, 92]];
@@ -493,6 +519,10 @@ function lookPanel() {
   };
   let sw = null;
   function draw() {
+    // Панель собирается заново после каждого выбора — прокрутка и фокус остаются
+    // там, где были, а не прыгают к началу
+    const was = tpanel.querySelector(".body"), top = was ? was.scrollTop : 0;
+    const act = document.activeElement, key = act && tpanel.contains(act) ? focusKey(act) : null;
     sw = h("div", { class: "swatches" }, SWATCH.map(([n, hh, sat]) => h("button", { class: "swt" + (LOOK.hue === hh ? " on" : ""),
       title: n, "aria-label": n, "data-h": hh, style: `background:hsl(${hh}, ${sat}%, 52%)`,
       onclick: () => { LOOK.hue = hh; LOOK.sat = sat; applyLook(true); draw(); } })));
@@ -501,6 +531,10 @@ function lookPanel() {
         h("div", {}, h("h2", {}, "Тема"), h("div", { class: "muted small" }, "для себя — запоминается на этом устройстве")),
         h("div", { class: "grow" }), h("button", { class: "ibtn", "aria-label": "Закрыть", onclick: closeLook }, icon("x"))),
       h("div", { class: "body" }, h("div", { class: "tbody" },
+        h("div", {}, h("div", { class: "eyebrow" }, "стиль"), h("div", { class: "even2", "data-name": "skin" },
+          [["cards", "Карточки"], ["toolza", "Классика"]].map(([k, t]) =>
+            h("button", { class: "chip" + (LOOK.skin === k ? " on" : ""), onclick: () => { setSkin(k); draw(); } }, t))),
+        h("div", { class: "muted small", style: "margin-top:6px" }, "«Карточки» — крупные карточки и меню в шапке; «Классика» — прежний вид")),
         h("div", {}, h("div", { class: "eyebrow" }, "режим"), h("div", { class: "even3" },
           [["dark", "Тёмная"], ["light", "Светлая"], ["auto", WEB ? "Системная" : "Как Telegram"]].map(([k, t]) =>
             h("button", { class: "chip" + (LOOK.mode === k ? " on" : ""), onclick: () => { LOOK.mode = k; applyLook(true); drawTop(); draw(); } }, t)))),
@@ -527,15 +561,21 @@ function lookPanel() {
           h("div", { class: "prow" }, h("span", { class: "chip on" }, "В сети ", h("span", { class: "n" }, "4")), pill("онлайн", "ok"),
             pill("92%", "warn"), h("i", { class: "switch on" }), ringSvg(64, 26, 4))),
         h("div", { class: "even2" },
-          h("button", { onclick: () => { LOOK = Object.assign({}, LOOK_DEF, { mode: LOOK.mode }); applyLook(true); drawTop(); draw(); toast("Вид по умолчанию"); } },
+          h("button", { onclick: () => { LOOK = Object.assign({}, LOOK_DEF, { mode: LOOK.mode, skin: LOOK.skin, rb: SKIN_RB[LOOK.skin] });
+            applyLook(true); drawTop(); draw(); toast("Вид по умолчанию"); } },
             icon("rotate-ccw"), "Сбросить"),
           h("button", { class: "btn-primary", onclick: closeLook }, "Готово")))));
+    const body = tpanel.querySelector(".body");
+    if (body && top) body.scrollTop = top;
+    if (key) { const el = [...tpanel.querySelectorAll("button, [role=switch], input")].find((x) => focusKey(x) === key); if (el) el.focus({ preventScroll: true }); }
   }
   draw();
   tpanel.classList.add("on");
   syncScrim();
   trapOpen(tpanel);
 }
+// Тот же элемент после перерисовки панели: по подписи для чтения с экрана или тексту
+const focusKey = (el) => el.tagName + "|" + (el.getAttribute("aria-label") || el.textContent.trim()).slice(0, 60);
 function closeLook() { tpanel.classList.remove("on"); syncScrim(); trapClose(tpanel); }
 
 const SUPPORT_URL = "https://t.me/awgToolza/156/157";
@@ -762,7 +802,22 @@ function drawTop() {
   const flag = app && S.status ? h("button", { class: "cflag", "aria-label": tip, title: tip, onclick: (ev) => serverInfo(ev.currentTarget) },
   flagEl(cc, 24) || h("span", { class: "cc" }, cc || icon("globe")), h("i", { class: "pulse " + srvPulse(st) })) : null;
   const upd = hasUpd();
-  topEl.replaceChildren(...[
+  // «Карточки» на телефоне и в узком окне: знак и версия «таблеткой», справа — значки
+  // без рамок и меню-«бутерброд» (нижней панели разделов нет)
+  topEl.classList.toggle("ktop", cardsSkin() && !railOn());
+  if (cardsSkin() && !railOn()) {
+    const ver = S.version || "", tb = (ic, label, onclick) => h("button", { class: "tbtn", title: label, "aria-label": label, onclick }, icon(ic));
+    topEl.replaceChildren(...[
+      h("a", { class: "kbrand", title: upd ? `AWG Toolza ${ver} · доступна ${S.update}` : "AWG Toolza",
+        onclick: app ? () => go(upd && curPath() === "/" ? "/update" : "/") : null },
+      logoImg(), h("b", {}, "AWG ", h("span", {}, "toolza")),
+      ver ? h("span", { class: "vpill" + (upd ? " upd" : "") }, ver, upd ? " ↑" : "", S.channel === "beta" ? h("i", {}, "beta") : null) : null),
+      h("div", { class: "grow" }), flag,
+      app ? tb("search", "Раздел, клиент или действие", openPal) : null,
+      app ? tb(themeNow() === "dark" ? "sun" : "moon", "Тема", lookPanel) : null,
+      app ? h("button", { class: "tbtn kburger", title: "Разделы", "aria-label": "Разделы", "aria-expanded": String(moreEl.classList.contains("on")),
+        onclick: toggleMore }, icon("menu"), upd ? h("i", { class: "tdot" }) : null) : supportButton()].filter(Boolean));
+  } else topEl.replaceChildren(...[
     h("a", { class: "lock", title: upd ? `AWG Toolza ${S.version} · доступна ${S.update}` : "AWG Toolza",
       onclick: app ? () => go(upd && curPath() === "/" ? "/update" : "/") : null }, logoImg(), lockupEl()),
     flag, h("div", { class: "grow" }),
@@ -806,10 +861,19 @@ function drawNav() {
   } else {
     railEl.replaceChildren();
   }
-  const tabs = app && !rail;
-  tabEl.style.display = tabs ? "" : "none";
+  const tabs = app && !rail, kmenu = tabs && cardsSkin();
+  tabEl.style.display = tabs && !kmenu ? "" : "none";
   if (!tabs) { tabEl.replaceChildren(); closeMore(); return; }
   const more = MORE();
+  if (kmenu) {
+    // Все разделы списком, ниже — тема, аккаунт или бот
+    const extra = more.filter(([p]) => !NAV.some(([q]) => q === p));
+    const item = ([p, ic, t]) => h("a", { class: p.startsWith("/") && isOn(p) ? "on" : null, role: "button", onclick: () => moreGo(p) },
+      icon(ic), h("span", {}, t), p === "/update" && hasUpd() ? h("i", { class: "badge" }) : null);
+    tabEl.replaceChildren();
+    moreEl.replaceChildren(h("nav", { class: "kmenu", "aria-label": "Разделы" }, NAV.map(item), h("hr"), extra.map(item)));
+    return;
+  }
   const moreOn = more.some(([p]) => p.startsWith("/") && isOn(p));
   tabEl.replaceChildren(...TABS.map(([p, ic, t]) => h("a", { href: "#" + p, class: isOn(p) ? "on" : null,
     onclick: (ev) => sameTab(ev, p) }, icon(ic), t)),
@@ -829,8 +893,9 @@ function moreGo(p) {
   else if (p === "support") openSupport();
   else go(p);
 }
-function toggleMore() { if (moreEl.classList.contains("on")) closeMore(); else { moreEl.classList.add("on"); syncScrim(); } }
-function closeMore() { moreEl.classList.remove("on"); syncScrim(); }
+function toggleMore() { if (moreEl.classList.contains("on")) closeMore(); else { moreEl.classList.add("on"); syncScrim(); kburgerSync(); } }
+function closeMore() { moreEl.classList.remove("on"); syncScrim(); kburgerSync(); }
+function kburgerSync() { const b = topEl.querySelector(".kburger"); if (b) b.setAttribute("aria-expanded", String(moreEl.classList.contains("on"))); }
 function syncScrim() {
   scrim.classList.toggle("on", moreEl.classList.contains("on") || drawerEl.classList.contains("on") || tpanel.classList.contains("on"));
 }
@@ -1172,6 +1237,21 @@ const tidy = (l) => {
   return " ".repeat(Math.max(0, lead - 2)) + l.trim().replace(/ {3,}/g, "  ");
 };
 
+// ── Шкала долгих задач обновления ─────────────────────────
+// Этапы — строки из журнала awg2 и установщика бота; доля — сколько обычно
+// пройдено к этому месту. Тот же список — в progress.py бота.
+const JOB_STAGES = {
+  "update install": [[/Канал:/, 10], [/Через зеркало/, 20], [/Прежняя версия|Уже последняя/, 75], [/Установлено:/, 92]],
+  "bot update": [[/Установщик бота|Найден локальный код/, 5], [/Скачиваю код бота|Код бота:/, 15], [/Зависимости Python/, 30],
+    [/Код и зависимости:/, 75], [/Веб-панель перезапущена/, 85], [/Бот перезапущен/, 92]],
+};
+// [пройдено, следующий этап] по журналу
+function jobReached(stages, text) {
+  let got = 0, next = stages.length ? stages[0][1] : 100;
+  stages.forEach(([re, p], i) => { if (re.test(text)) { got = Math.max(got, p); next = i + 1 < stages.length ? stages[i + 1][1] : 100; } });
+  return [got, next];
+}
+
 // ── Задача с живым журналом ────────────────────────────────
 // Долгое (массовое создание, установка, сборка) идёт задачей awg2: журнал —
 // по ходу, итог — на том же экране. done(data) рисует кнопки итога;
@@ -1182,11 +1262,21 @@ const tidy = (l) => {
 async function runJob(ctx, title, args, done, opts = {}) {
   const started = Date.now(), name = plainTitle(title);
   const state = pill("идёт", "accent");
-  const head = h("h1", {}, name, state), time = h("div", { class: "muted small mono" }), log = h("pre", {}, "запускаю…");
-  const finish = (ok, text) => { state.className = "pill " + (ok ? "ok" : "bad"); state.textContent = text; };
+  // Состояние и время — строкой под заголовком: в самом заголовке метка не вставала вровень
+  const time = h("span", { class: "jt" }), log = h("pre", {}, "запускаю…");
+  // Шкала — у обновлений awg2 и бота: этапы из журнала, между ними — понемногу к следующему
+  const stages = JOB_STAGES[args.slice(0, 2).join(" ")];
+  const barIn = h("i"), bar = stages ? h("div", { class: "jbar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100" }, barIn) : null;
+  let pct = 0;
+  const setBar = (p, cls) => {
+    if (!bar) return;
+    pct = p; barIn.style.width = Math.round(p) + "%"; bar.setAttribute("aria-valuenow", String(Math.round(p)));
+    if (cls) bar.classList.add(cls);
+  };
+  const finish = (ok, text) => { state.className = "pill " + (ok ? "ok" : "bad"); state.textContent = text; setBar(ok ? 100 : pct, ok ? "ok" : "bad"); };
   const foot = h("div");
   const backBtn = (ok) => h("button", { class: "btn-block", onclick: () => (opts.onBack || render)(ok) }, "◀️ Назад");
-  ctx.put(head, time, log, foot);
+  ctx.put(h("h1", {}, name), h("div", { class: "jobhead", "data-name": "job" }, state, bar, time), log, foot);
   let id;
   try {
     id = (await post("/api/job", { args, stdin: opts.stdin })).data.id;
@@ -1228,7 +1318,12 @@ async function runJob(ctx, title, args, done, opts = {}) {
       log.textContent = text.split("\n").filter((l) => !/^[\s━─═—–-]*$/.test(l)).map(tidy).slice(-300).join("\n") || "идёт…";
       log.scrollTop = log.scrollHeight;
     }
-    if (live) time.textContent = fmtDur((Date.now() - started) / 1000);
+    if (stages && st.state === "running") {
+      const [got, next] = jobReached(stages, text);
+      const p = Math.max(pct, got);
+      setBar(p < next - 1 ? Math.min(p + (next - p) * 0.08, next - 1) : p);
+    } else if (stages && st.state === "done" && st.ok) setBar(100);
+    if (live) time.textContent = (bar ? Math.round(pct) + "% · " : "") + fmtDur((Date.now() - started) / 1000);
     if (st.state === "running") continue;
     const ok = st.state === "done" && st.ok;
     if (!live) {
@@ -1879,12 +1974,34 @@ function setStatus(d, gen) {
   favRefresh();
 }
 
-route(/^\/$/, async (ctx) => {
-  let clErr = null;
-  const gen = chanGen;
-  const [me, d, cl, traffic, evlog, wob] = await Promise.all([post("/api/me"), post("/api/status"), post("/api/clients").catch((e) => { clErr = e; return null; }),
-    call("traffic", "daily", "all", 14).catch(() => null), callR(["log", "expire", "80"]).catch(() => null),
+// Вторичное на главной (график за 14 дней, события, клиенты Phobos) экран не
+// держит: сводку и клиентов рисуем, как только пришли, а это ждём не дольше
+// HOME_EXTRA_WAIT — опоздавшее дорисуется само, тем, что пришло. Дорисовка — со
+// сводкой и клиентами, что уже на экране: без новых запросов (раньше она заново
+// ждала awg2, и экран всё это время был притушен и не нажимался).
+// Каждый заход на главную берёт свежее; идущий запрос не повторяется
+const HOME_EXTRA_WAIT = 250;
+let homeExtra = null, homeRedraw = null;
+function homeExtraLoad() {
+  if (homeExtra && !homeExtra.v) return homeExtra;
+  const p = Promise.all([call("traffic", "daily", "all", 14).catch(() => null), callR(["log", "expire", "80"]).catch(() => null),
     call("wgobf", "clients").catch(() => null)]);
+  const x = homeExtra = { p, v: null };
+  p.then((v) => { x.v = v; });
+  return x;
+}
+
+route(/^\/$/, async (ctx) => {
+  const gen = chanGen;
+  const redraw = homeRedraw;
+  homeRedraw = null;
+  let clErr = redraw ? redraw.clErr : null;
+  const ex = redraw ? redraw.ex : homeExtraLoad();
+  const [me, d, cl] = redraw ? redraw.main
+    : await Promise.all([post("/api/me"), post("/api/status"), post("/api/clients").catch((e) => { clErr = e; return null; })]);
+  const extra = ex.v || await Promise.race([ex.p, new Promise((ok) => setTimeout(() => ok(null), HOME_EXTRA_WAIT))]);
+  if (!extra) ex.p.then(() => { if (ctx.live() && curPath() === "/") { homeRedraw = { ex, main: [me, d, cl], clErr }; render(); } });
+  const [traffic, evlog, wob] = extra || [null, null, null];
   S.me = me;
   setStatus(d, gen);
   if (cl) { S.clients = cl; if (!S.sort) S.sort = cl.sort || "activity"; }
@@ -2131,6 +2248,7 @@ function clientTags(c) {
     c.mimicry && c.mimicry !== "none" ? tag(c.mimicry, "accent", "drama") : tag("без I1-I5"),
     expLive(c) ? tag(expShort(c.expires), left < 3 * 86400 ? "warn" : "", "hourglass") : null,
     c.limit ? tag(`лимит ${Math.min(999, Math.round(c.used * 100 / c.limit))}%`, c.used >= c.limit * 0.9 ? "warn" : "", "gauge") : null,
+    speedNow(c) ? tag(`${speedNow(c)} Мбит/с`, speedNow(c) !== c.speed ? "warn" : "", speedNow(c) !== c.speed ? "timer" : "zap") : null,
     routeTag(c, (S.clients && S.clients.route) || {}),
     c.mon ? tag("мониторинг", "", "bell") : null,
   ];
@@ -2156,17 +2274,138 @@ const avaColor = (name) => { let x = 7; for (const ch of name) x = (x * 31 + ch.
 const ava = (c) => h("div", { class: "ava " + clientState(c), style: `background:${avaColor(c.name)}` },
   c.name.replace(/[^A-Za-z0-9]/g, "").slice(0, 2) || "?");
 
+// ── Стиль «Карточки»: общие детали экранов ────────────────
+// Вид карточек: список (коротко), подробно, сетка (подробности в две колонки)
+const KVIEWS = [["list", "list", "Список"], ["full", "layout-list", "Подробно"], ["grid", "layout-grid", "Сетка"]];
+const kviewOf = (key, list = KVIEWS) => { const v = pref(key, "full"); return list.some(([k]) => k === v) ? v : "full"; };
+const kchip = (text, cls = "", ic = null) => h("span", { class: "kchip " + cls }, ic ? icon(ic) : null, text);
+// Вкладки с подчёркиванием и счётчиком в кружке
+const ktabs = (items, cur, pick) => h("div", { class: "ktabs", role: "tablist" }, items.map(([k, label, n]) =>
+  h("button", { class: k === cur ? "on" : null, role: "tab", "aria-selected": String(k === cur), "data-tab": k, onclick: () => pick(k) },
+    label, n != null ? h("span", { class: "kn" }, n) : null)));
+// Сводка одним блоком: 2×2 на телефоне, в ряд на широком экране. [значение, ПОДПИСЬ, пояснение, onclick]
+const kstats = (cells) => h("div", { class: "kstats" }, cells.filter(Boolean).map(([big, label, sub, onclick]) =>
+  h("div", { class: onclick ? "tap" : null, onclick }, h("b", { class: String(big).length > 10 ? "long" : null }, big),
+    h("div", { class: "lb" }, label), sub ? h("div", { class: "sb" }, sub) : null)));
+// Адрес сервера, прокси: скрыт точками, «глаз» показывает
+function masked(text) {
+  if (!text) return "—";
+  const val = h("span", { class: "mask" }, "••••••••");
+  const eye = h("button", { class: "eyeb", "aria-label": "Показать", title: "Показать", onclick: (ev) => {
+    ev.stopPropagation();
+    const open = val.classList.contains("mask");
+    val.textContent = open ? text : "••••••••";
+    val.classList.toggle("mask", !open);
+    eye.replaceChildren(icon(open ? "eye-off" : "eye"));
+    eye.setAttribute("aria-label", open ? "Скрыть" : "Показать");
+  } }, icon("eye"));
+  return [val, eye];
+}
+// Переключатель и шестерня в карточке: нажатие не открывает саму карточку
+const kswitch = (on, label, fn, dis) => h("button", { class: "kswitch", role: "switch", "aria-checked": String(!!on), "aria-label": label,
+  title: dis || label, disabled: dis ? true : null, onclick: (ev) => { ev.stopPropagation(); fn(ev.currentTarget); } },
+h("i", { class: "switch" + (on ? " on" : "") }));
+const kgear = (label, fn) => h("button", { class: "tbtn", title: label, "aria-label": label,
+  onclick: (ev) => { ev.stopPropagation(); fn(); } }, icon("settings"));
+// Замок: туннель работает — «Удалить» не нажимается, пока его не выключат
+const klock = (why) => h("span", { class: "klock", title: why, "aria-label": why, role: "img" }, icon("lock"));
+// Кнопка внизу карточки; dis — причина, почему сейчас нельзя (кнопка бледная)
+const kact = (ic, label, fn, cls, dis) => h("button", { class: cls || null, disabled: dis ? true : null, title: dis || null,
+  onclick: (ev) => { ev.stopPropagation(); fn(ev.currentTarget); } }, icon(ic), label);
+// Карточка: рамка и точка по состоянию (on — работает, warn — внимание, bad — сбой,
+// none — не настроено), имя, справа замок / переключатель / шестерня, строка
+// «интерфейс + чипы», подробности (в «Сетке» — в две колонки), кнопки снизу
+function kcard({ state = "", cls = "", name, iface, chips, right, kv, view = "full", extra, acts, onopen, attrs = {} }) {
+  const rows = view === "list" ? [] : (kv || []).filter(Boolean);
+  const ch = (chips || []).filter(Boolean);
+  return h("div", Object.assign({ class: ["kcard", state, cls].filter(Boolean).join(" ") }, attrs),
+    h("div", { class: "kc-h", onclick: onopen }, h("i", { class: "kdot " + state }), h("div", { class: "kc-n" }, name),
+      right ? h("div", { class: "kc-r" }, right) : null),
+    iface || ch.length ? h("div", { class: "kc-s", onclick: onopen }, iface ? h("span", { class: "kc-if" }, iface) : null, ch) : null,
+    rows.length ? h("div", { class: "kc-kv" + (view === "grid" ? " g2" : "") },
+      rows.map(([k, v]) => h("div", {}, h("span", {}, k), h("b", {}, v)))) : null,
+    view === "list" ? null : extra || null,
+    acts && acts.length ? h("div", { class: "kc-a" }, acts) : null);
+}
+// Трафик карточки: принято, отдано, всего — счётчики интерфейса, с его запуска
+// (после перезапуска туннеля — снова с нуля)
+const kTraffic = (rx, tx) => h("div", { class: "kc-tr", title: "С запуска интерфейса" },
+  [["принято", "↓ " + fmtBytes(rx)], ["отдано", "↑ " + fmtBytes(tx)], ["всего", fmtBytes(rx + tx)]]
+    .map(([k, v]) => h("div", {}, h("span", {}, k), h("b", {}, v))), h("i", { class: "kc-trn" }, "с запуска интерфейса"));
+// ↓ и ↑ коротко — в узкой ячейке сводки
+const rxtx = (rx, tx) => `↓${fmtBytes(rx)} ↑${fmtBytes(tx)}`;
+const agoText = (ts) => (ts ? fmtDur(Date.now() / 1000 - ts) + " назад" : "не было");
+// Заголовок экрана, строка «N чего-то» со значками справа, панель 2×2
+const khead = (text, ...right) => h("div", { class: "khead" }, h("h1", {}, text), right);
+const kline = (text, ...right) => h("div", { class: "kline" }, h("span", { class: "grow" }, text), right);
+const ktbtn = (ic, label, fn, on) => h("button", { class: "tbtn" + (on ? " on" : ""), title: label, "aria-label": label,
+  "aria-pressed": on == null ? null : String(!!on), onclick: (ev) => fn(ev.currentTarget) }, icon(ic));
+
+// Площадь под линией: мини-график трафика по дням в карточке клиента
+function areaSvg(vals, W, H) {
+  const n = vals.length, max = Math.max(1, ...vals);
+  const X = (i) => (n > 1 ? i * W / (n - 1) : W / 2), Y = (v) => H - 1.5 - (H - 5) * v / max;
+  const pts = vals.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`);
+  const el = svg("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", "aria-hidden": "true" });
+  if (n) el.append(svg("path", { class: "ar", d: `M${pts.join("L")}L${X(n - 1)},${H}L${X(0)},${H}Z` }), svg("path", { class: "ln", d: "M" + pts.join("L") }));
+  return el;
+}
+// Окно графика клиента: период кнопками, итоги (трафик, пик, в среднем), график по дням
+function clientChart(name) {
+  let days = 14, close = null, gen = 0;
+  const pills = h("div", { class: "kpills", role: "group", "aria-label": "Период" }), period = kchip("", "", "calendar-clock");
+  const body = h("div", { class: "kch-b" });
+  const box = h("div", { class: "sheet kchs", "aria-label": "Трафик " + name, "data-name": "client-chart" },
+    h("div", { class: "kch-h" }, h("h3", {}, "Трафик"), h("button", { class: "tbtn", "aria-label": "Закрыть", title: "Закрыть", onclick: () => close() }, icon("x"))),
+    h("div", { class: "kc-s" }, kchip(name, "acc", "user"), period), pills, body);
+  async function load() {
+    const my = ++gen;
+    pills.replaceChildren(...[7, 14, 30].map((n) => h("button", { class: n === days ? "on" : null, "aria-pressed": String(n === days),
+      onclick: () => { days = n; load(); } }, n + " дн.")));
+    period.lastChild.textContent = `последние ${days} дн.`;
+    body.replaceChildren(h("div", { class: "spin" }, "Загрузка…"));
+    try {
+      const t = await call("traffic", "daily", name, days);
+      if (my !== gen) return;
+      const sum = (a) => (a || []).reduce((x, y) => x + y, 0), rx = sum(t.rx), tx = sum(t.tx);
+      const tot = (t.days || []).map((_, i) => (t.rx[i] || 0) + (t.tx[i] || 0)), peak = Math.max(0, ...tot);
+      body.replaceChildren(h("div", { class: "ksum" }, [["трафик", `↓ ${fmtBytes(rx)} · ↑ ${fmtBytes(tx)}`], ["пик за день", fmtBytes(peak)],
+        ["в среднем", fmtBytes(tot.length ? Math.round((rx + tx) / tot.length) : 0) + "/день"]]
+        .map(([k, v]) => h("div", {}, h("span", {}, k), h("b", {}, v)))), lineChart(t, { H: 120 }));
+    } catch (e) { if (my === gen) body.replaceChildren(h("div", { class: "bad" }, "❌ " + e.message)); }
+  }
+  close = sheetOpen(box);
+  load();
+}
+
 const CLIENTS_RE = route(/^\/clients$/, async (ctx) => {
   await loadClients();
   const D = () => S.clients;                 // карточка справа обновляет S.clients — список рисуется заново
   // На ПК — таблица или карточки сеткой; на телефоне и в Mini App — карточки или строки
-  const wide = desk(), vkey = wide ? "view-desk" : "view";
-  S.view = pref(vkey, wide ? "table" : "cards");
-  if (wide && S.view === "list") S.view = "table";
-  if (!wide && S.view === "table") S.view = "cards";
-  const tabs = h("div"), toolbar = h("div", { class: "ctools" }), list = h("div"), bar = h("div", { class: "bar", style: "display:none" });
+  const wide = desk(), kskin = cardsSkin();
+  // «Карточки»: на телефоне — список, подробно, сетка; на ПК вместо списка — таблица
+  const KV = wide ? [["table", "grid-3x3", "Таблица"]].concat(KVIEWS.slice(1)) : KVIEWS;
+  const vkey = kskin ? (wide ? "kview-desk" : "kview") : wide ? "view-desk" : "view";
+  S.view = pref(vkey, kskin ? (wide ? "table" : "full") : wide ? "table" : "cards");
+  if (kskin && !KV.some(([k]) => k === S.view)) S.view = wide ? "table" : "full";
+  if (!kskin && wide && S.view === "list") S.view = "table";
+  if (!kskin && !wide && S.view === "table") S.view = "cards";
+  // Трафик по дням всех клиентов — для мини-графиков; приходит позже списка
+  let daily = null;
+  if (kskin) {
+    call("traffic", "daily", "all", 14).then((t) => {
+      daily = {};
+      ((t && t.clients) || []).forEach((c) => { daily[c.name] = c.d || []; });
+      daily[""] = ((t && t.days) || []).map(() => 0);
+      const sum = (a) => (a || []).reduce((x, y) => x + y, 0);
+      daily.$ = { rx: sum(t && t.rx), tx: sum(t && t.tx) };
+      if (ctx.live() && S.listRedraw) S.listRedraw();
+    }).catch(() => {});
+  }
+  const tabs = h("div"), toolbar = h("div", { class: kskin ? "ktools" : "ctools" }), list = h("div"), bar = h("div", { class: "bar", style: "display:none" });
+  const kseg = h("div"), stats = h("div");
   const headBox = h("div");
-  const search = h("input", { type: "search", placeholder: "Поиск по имени, IP, заметке", value: S.q, "aria-label": "Поиск",
+  const search = h("input", { type: "search", placeholder: kskin ? "Поиск" : "Поиск по имени, IP, заметке", value: S.q, "aria-label": "Поиск",
     oninput: () => { S.q = search.value.trim().toLowerCase(); draw(); } });
   // Поле поиска остаётся в панели инструментов навсегда: пересоздай его draw() — фокус пропал бы после каждой буквы
   toolbar.append(h("div", { class: "search" }, icon("search"), search));
@@ -2236,13 +2475,86 @@ const CLIENTS_RE = route(/^\/clients$/, async (ctx) => {
       await deliver({ what: "export" }, "Архив всех конфигов — в чате с ботом");
     }) }, icon("download"), "Экспорт");
   }
-  function createBtn() {
+  function createBtn(label = "Новый клиент") {
     return h("button", { class: "btn-primary", onclick: async () => {
       const v = await sheet("Новые клиенты", [{ label: "➕ Один клиент", value: "/add" }, { label: "👥 Несколько сразу", value: "/bulk" }]);
       if (v) go(v);
-    } }, icon("plus"), "Новый клиент");
+    } }, icon("plus"), label);
+  }
+  const sortFlip = () => {
+    S.sort = S.sort === "name" ? "activity" : "name";
+    post("/api/settings", { sort: S.sort }).catch(() => {});
+    toast(S.sort === "name" ? "По имени" : "По активности");
+    draw();
+  };
+  // «Карточки»: справа — состояние, под именем — IP и чипы, подробности, график по дням
+  function kstatus(c) {
+    if (c.blocked) return kchip(blockedWord(c), "bad");
+    if (c.online) return kchip("онлайн", "ok");
+    return kchip(c.handshake ? fmtDur(c.ago) + " назад" : "не подключался");
+  }
+  function kroute(c) {
+    const r = (S.clients && S.clients.route) || {};
+    if (r.kind === "xray" && c.xray !== false && c.xray_out) return kchip("Xray: " + c.xray_out, "ok", "network");
+    if (r.kind === "warp" || r.kind === "xray") return c[r.kind] !== false ? kchip(r.kind === "warp" ? "WARP" : "Xray", "ok", "network")
+      : kchip("напрямую", "", "network");
+    if (r.kind === "tun2socks") return kchip("tun2socks", "ok", "network");
+    if (r.kind !== "exits") return null;
+    const v = c.exit_choice || "shared";
+    return v === "off" ? kchip("мимо нод", "", "door-open") : kchip(v === "shared" ? "общий выход" : "нода " + v, "ok", "door-open");
+  }
+  function kclient(c) {
+    const enc = encodeURIComponent(c.name), v = S.view, sel = S.select && S.select.has(c.name);
+    const left = c.expires ? c.expires - Date.now() / 1000 : 0, pct = c.limit ? Math.min(999, Math.round((c.used || 0) * 100 / c.limit)) : 0;
+    const days = daily ? daily[c.name] || daily[""] : null, chart = () => clientChart(c.name);
+    const graph = !days ? h("div", { class: "kc-ch wait" }, h("div", { class: "kc-cap" }, h("span", {}, "14 дней"), h("b", {}, "…")))
+      : v === "full" ? h("div", { class: "kc-ch", role: "button", title: "График", "aria-label": "График трафика " + c.name,
+        onclick: (ev) => { ev.stopPropagation(); chart(); } },
+      h("div", { class: "kc-cap" }, h("span", {}, "14 дней"), h("b", {}, fmtBytes(days.reduce((a, b) => a + b, 0)))), areaSvg(days, 300, 56))
+        : h("div", { class: "kc-mini", role: "button", title: "График", "aria-label": "График трафика " + c.name,
+          onclick: (ev) => { ev.stopPropagation(); chart(); } }, areaSvg(days, 120, 30), h("b", {}, "сегодня " + fmtBytes(c.today || 0)));
+    return kcard({ view: v, state: clientState(c), cls: sel ? "sel" : "", name: c.name, iface: c.ip,
+      attrs: { "data-name": c.name }, onopen: () => open(c), right: S.select ? mark(c) : kstatus(c),
+      chips: [c.mimicry && c.mimicry !== "none" ? kchip(c.mimicry, "acc", "drama") : kchip("без I1-I5"),
+        expLive(c) ? kchip(expShort(c.expires), left < 3 * 86400 ? "warn" : "", "hourglass") : null,
+        c.limit ? kchip(`лимит ${pct}%`, c.used >= c.limit * 0.9 ? "warn" : "", "gauge") : null,
+        kroute(c), c.mon ? kchip("мониторинг", "", "bell") : null],
+      kv: [["Рукопожатие", c.handshake ? fmtDur(c.ago) + " назад" : "не было"], ["Сегодня", fmtBytes(c.today || 0)],
+        ["Срок", expLive(c) && left > 0 ? "ещё " + expShort(c.expires) : c.expires ? "истёк" : "бессрочно"],
+        c.limit ? ["Лимит", `${pct}% · ${fmtBytes(c.used)} из ${fmtBytes(c.limit)}`] : null,
+        v === "grid" ? ["Принято", "↓ " + fmtBytes(c.rx)] : null, v === "grid" ? ["Отдано", "↑ " + fmtBytes(c.tx)] : null,
+        c.note ? ["Заметка", c.note] : null],
+      extra: graph,
+      acts: S.select ? null : [act("qr-code", "QR", () => go(`/client/${enc}/qr`)),
+        act("square-pen", "Изменить", () => go(`/client/${enc}`)),
+        act("trash-2", "Удалить", (b) => removeClients(b, [c.name], render), "bad")] });
+  }
+  function drawK() {
+    const d = D(), rows = visible(), n = d.rows.length, on = count("online");
+    const rx = d.rows.reduce((a, c) => a + (c.rx || 0), 0), tx = d.rows.reduce((a, c) => a + (c.tx || 0), 0);
+    const today = d.rows.reduce((a, c) => a + (c.today || 0), 0);
+    const lead = d.rows.filter((c) => c.today).sort((a, b) => b.today - a.today)[0];
+    headBox.replaceChildren(khead("Клиенты"));
+    tabs.replaceChildren(ktabs(FILTERS.map(([k, label]) => [k, label, count(k)]), S.filter, (k) => { S.filter = k; draw(); }),
+      kline(`${n} ${plural(n, "конфиг", "конфига", "конфигов")} · ${on} в сети` + (count("blocked") ? ` · ${count("blocked")} заблок.` : ""),
+        ktbtn(S.sort === "name" ? "arrow-down-a-z" : "activity", "Сортировка: " + (S.sort === "name" ? "по имени" : "по активности"), sortFlip),
+        ktbtn("list-checks", "Выбрать несколько", () => { S.select = S.select ? null : new Set(); draw(); }, !!S.select)));
+    if (toolbar.children.length === 1) toolbar.append(kseg, exportBtn(), createBtn("Создать"));
+    kseg.replaceChildren(segBar(KV, S.view, (v) => { S.view = v; setPref(vkey, v); draw(); }));
+    stats.replaceChildren(kstats([[`${on}/${n}`, "В сети", "клиентов сейчас"],
+      [fmtBytes(today), "Сегодня", lead ? `больше всех — ${lead.name}` : "трафика нет"],
+      daily && daily.$ ? [fmtBytes(daily.$.rx + daily.$.tx), "За 14 дней", rxtx(daily.$.rx, daily.$.tx)]
+        : [fmtBytes(rx + tx), "С запуска awg0", rxtx(rx, tx)],
+      [lead ? lead.name : "—", "Лидер", lead ? fmtBytes(lead.today) + " сегодня" : "за сегодня"]]));
+    const noSrv = S.status && S.status.server && S.status.server.exists === false;
+    const empty = h("div", { class: "kempty" }, d.rows.length ? "Никого не нашлось"
+      : noSrv ? ["Сервер ещё не создан — ", linkTo("создать сервер", "/server/create")] : "Клиентов пока нет — создай первого");
+    list.className = S.view === "table" ? "tscroll" : "klist";
+    list.replaceChildren(...(!rows.length ? [empty] : S.view === "table" ? [table(rows)] : rows.map(kclient)));
+    drawSel(rows);
   }
   function draw() {
+    if (kskin) return drawK();
     const d = D(), rows = visible();
     const today = d.rows.reduce((a, c) => a + (c.today || 0), 0), n = d.rows.length;
     const net = S.status && S.status.server && S.status.server.net;
@@ -2269,6 +2581,9 @@ const CLIENTS_RE = route(/^\/clients$/, async (ctx) => {
     list.className = S.view === "cards" ? "clist" : S.view === "table" ? "tscroll" : "";
     list.replaceChildren(...(!rows.length ? [empty] : S.view === "table" ? [table(rows)] : S.view === "list"
       ? [h("div", { class: "card list" }, rows.map(row))] : rows.map(card)));
+    drawSel(rows);
+  }
+  function drawSel(rows) {
     // Строка, чья карточка открыта справа, — подсвечена
     const cur = (curPath().match(/^\/client\/([^/]+)/) || [])[1];
     if (cur) list.querySelectorAll("[data-name]").forEach((el) => el.classList.toggle("cur", el.dataset.name === decodeURIComponent(cur)));
@@ -2286,7 +2601,7 @@ const CLIENTS_RE = route(/^\/clients$/, async (ctx) => {
       bar.style.display = "none";
     }
   }
-  ctx.put(headBox, tabs, toolbar, list, bar);
+  ctx.put(headBox, tabs, toolbar, kskin ? stats : null, list, bar);
   draw();
   // Список на месте — карточка клиента на ПК откроется поверх него, без новой загрузки
   if (ctx.live()) S.listShown = true;
@@ -2319,13 +2634,25 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
   async function setLimit(btn) {
     const v = await sheet("Лимит трафика · " + name, [
       ...["10", "50", "100", "300"].map((g) => ({ label: `📶 ${g} ГБ в месяц`, value: g + "G" })),
-      { label: "✏️ Свой размер или «всего»…", value: "custom" },
+      { label: "✏️ Свой размер, «всего», при исчерпании…", value: "custom" },
       ...(c.limit ? [{ label: "🔄 Обнулить счётчик", value: "reset" }, { label: "♾ Снять лимит", value: "off" }] : [])]);
     if (!v) return;
     if (v === "custom") return go(`/client/${enc}/limit`);
     await busy(btn, async () => {
       await (v === "reset" ? call("client", "limit-reset", name) : call("client", "limit", name, v, "month"));
       haptic(); toast(v === "off" ? "Лимит снят" : v === "reset" ? "Счётчик обнулён" : "Лимит установлен"); render();
+    });
+  }
+  async function setSpeed(btn) {
+    const v = await sheet("Скорость · " + name, [
+      ...SPEEDS.map((n) => ({ label: `${c.speed === n ? "✅" : "🚀"} ${n} Мбит/с`, value: String(n) })),
+      { label: "✏️ Своя…", value: "custom" },
+      ...(c.speed ? [{ label: "♾ Без ограничения", value: "off" }] : [])]);
+    if (!v) return;
+    if (v === "custom") return go(`/client/${enc}/speed`);
+    await busy(btn, async () => {
+      await call("client", "speed", name, v);
+      haptic(); toast(v === "off" ? "Скорость без ограничения" : `Скорость ${v} Мбит/с`); render();
     });
   }
   // Маршрут клиента — выбор прямо в карточке: варианты работающего туннеля
@@ -2376,7 +2703,9 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       c.note ? kv("Заметка", c.note) : null), routeCard()),
     area("traf", h("div", { class: "card" },
       kv("За месяц", fmtBytes(c.month)), kv("Сегодня", fmtBytes(c.today)),
-      kv("Лимит", c.limit ? limitText(c) : "нет"), c.limit ? meter(c.used, c.limit) : null, chartBox)),
+      kv("Лимит", c.limit ? limitText(c) + (c.limit_slow ? ` · исчерпал — 🐢 до ${c.limit_slow} Мбит/с` : "") : "нет"),
+      c.limit ? meter(c.used, c.limit) : null,
+      kv("Скорость", speedText(c) || "без ограничения"), chartBox)),
     // Сообщает Telegram-бот: в веб-панели без бота присылать некому — так и говорим
     area("mon", switchRow("Мониторинг активности", noBot() ? "уведомления присылает Telegram-бот — он не установлен"
       : "уведомления в чат, когда клиент пропал и вернулся", c.mon, async (on) => {
@@ -2389,6 +2718,7 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       h("button", { onclick: () => go(`/client/${enc}/rename`) }, "✏️ Имя"),
       h("button", { onclick: (ev) => setExpire(ev.currentTarget) }, "⏳ Срок"),
       h("button", { onclick: (ev) => setLimit(ev.currentTarget) }, "📶 Лимит"),
+      h("button", { onclick: (ev) => setSpeed(ev.currentTarget) }, "🚀 Скорость"),
       h("button", { onclick: () => go(`/client/${enc}/mimicry`) }, "🎭 Мимикрия"),
       h("button", { onclick: () => go(`/client/${enc}/note`) }, "📝 Заметка"))),
     // После удаления — шаг назад к списку, а не второй список поверх первого
@@ -2417,8 +2747,44 @@ route(/^\/client\/([^/]+)\/qr$/, async (ctx, name) => {
     h("div", { class: "muted small", style: "text-align:center;margin:6px 0 10px" }, "AmneziaVPN / AmneziaWG → добавить → QR или файл"),
     confBtns(name),
     copyBtn("Скопировать конфиг", d.text),
+    shareBox(name),
     h("pre", { class: "small" }, d.text));
 });
+
+// Ссылка на конфиг на 5 минут: по ней — QR, текст и файл .conf. Адрес — тот, по
+// которому открыта панель (без секретного пути веб-панели)
+function shareBox(name) {
+  const box = h("div", { "data-name": "share" });
+  const idle = () => box.replaceChildren(h("button", { class: "btn-block", onclick: (ev) => busy(ev.currentTarget, make) },
+    "🔗 Ссылка на 5 минут"));
+  let timer = 0;
+  async function make() {
+    const d = await post("/api/client/share", { name });
+    haptic();
+    const left = h("span", {}), field = h("input", { readonly: "", value: d.url, "aria-label": "Ссылка на конфиг" });
+    field.onfocus = () => field.select();
+    const tick = () => {
+      if (!box.isConnected) return clearInterval(timer);
+      const s = Math.max(0, Math.round(d.exp - Date.now() / 1000));
+      left.textContent = s ? `действует ещё ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : "срок истёк";
+      if (!s) { clearInterval(timer); idle(); }
+    };
+    clearInterval(timer); timer = setInterval(tick, 1000); tick();
+    box.replaceChildren(h("div", { class: "card" },
+      h("div", { class: "eyebrow" }, "ссылка на конфиг · ", left), field,
+      h("div", { class: "even2", style: "margin-top:8px" },
+        copyBtn("Скопировать", d.url, ""),
+        !WEB && tg && tg.openTelegramLink
+          ? h("button", { onclick: () => tg.openTelegramLink("https://t.me/share/url?url=" + encodeURIComponent(d.url)) }, "✈️ Переслать")
+          : null),
+      h("button", { class: "btn-danger btn-block", onclick: (ev) => busy(ev.currentTarget, async () => {
+        await post("/api/client/share/revoke", { id: d.id }); clearInterval(timer); haptic(); toast("Ссылка отозвана"); idle();
+      }) }, "🚫 Отозвать"),
+      hint("По ссылке — QR, текст и файл .conf, 5 минут. Это доступ к VPN: отправляй только тому, кому конфиг предназначен.")));
+  }
+  idle();
+  return box;
+}
 
 route(/^\/client\/([^/]+)\/rename$/, async (ctx, name) => {
   const input = h("input", { value: name, maxlength: 32, autocapitalize: "off", autocomplete: "off" });
@@ -2463,16 +2829,48 @@ route(/^\/client\/([^/]+)\/limit$/, async (ctx, name) => {
   const seg = h("div");
   const drawSeg = () => seg.replaceChildren(segText([["month", "В месяц"], ["total", "Всего"]], period, (p) => { period = p; drawSeg(); }));
   drawSeg();
+  // Что делать при исчерпании — сразу, без «Сохранить»: работает и для уже стоящего лимита
+  let mode = c.limit_slow ? String(c.limit_slow) : "block";
+  const modes = h("div");
+  const drawModes = () => modes.replaceChildren(h("div", { class: "chips", "data-name": "limit-mode" }, SLOW_MODES.map(([k, l]) =>
+    h("button", { class: k === mode ? "on" : null, "data-v": k, onclick: (ev) => (k === mode ? null : busy(ev.currentTarget, async () => {
+      await call("client", "limit-mode", name, k); mode = k; haptic(); drawModes();
+      toast(k === "block" ? "Исчерпал — блокировать" : `Исчерпал — замедлять до ${k} Мбит/с`);
+    })) }, l))));
+  drawModes();
   ctx.put(title("📶 Лимит · " + name),
     h("label", {}, "Размер: 50G, 500MB, 1.5T; число без буквы — гигабайты"), input, seg,
-    hint("Исчерпал лимит — клиент блокируется, как истёкший. «В месяц» — счётчик обнуляется 1-го числа, и клиент "
-      + "разблокируется сам; «всего» — считается с этой минуты, без сброса."),
+    h("label", {}, "Исчерпал лимит"), modes,
+    hint("«Блокировать» — клиент отключается, как истёкший; «замедлять» — остаётся на связи на малой скорости. "
+      + "«В месяц» — счётчик обнуляется 1-го числа, и всё снимается само; «всего» — считается с этой минуты, без сброса."),
     enterTo(h("button", { class: "btn-primary btn-block", onclick: (ev) => busy(ev.currentTarget, async () => {
       const v = input.value.trim().replace(/\s+/g, "").toUpperCase().replace("ГБ", "G").replace("МБ", "M").replace("ТБ", "T").replace("КБ", "K");
       // Как parse_size в awg2: 50G, 50GB, 50GiB, 500M; число без буквы — гигабайты
       if (!/^\d{1,7}([.,]\d{1,3})?([KMGT](I?B)?)?$/.test(v)) throw new Error("Размер: например 50G или 500M");
       await call("client", "limit", name, v, period); haptic(); toast("Лимит установлен"); back();
     }) }, "Сохранить"), input));
+  input.focus();
+});
+
+route(/^\/client\/([^/]+)\/speed$/, async (ctx, name) => {
+  await loadClients();
+  const c = byName(name) || {};
+  const input = h("input", { placeholder: "20", inputmode: "numeric", value: c.speed ? String(c.speed) : "", autocomplete: "off" });
+  const save = (v) => call("client", "speed", name, v).then(() => {
+    haptic(); toast(v === "off" ? "Скорость без ограничения" : `Скорость ${v} Мбит/с`); back();
+  });
+  ctx.put(title("🚀 Скорость · " + name),
+    h("label", {}, "Мбит/с — одна цифра на скачивание и отдачу"), input,
+    h("div", { class: "chips" }, SPEEDS.map((n) => h("button", { class: c.speed === n ? "on" : null,
+      onclick: () => { input.value = String(n); input.focus(); } }, `${n}`))),
+    hint("Действует при любом маршруте — напрямую, WARP, Xray, exit-ноды. Если один конфиг стоит на нескольких "
+      + "устройствах, они делят скорость. Исчерпал лимит трафика с «замедлять» — действует меньшая из двух."),
+    enterTo(h("button", { class: "btn-primary btn-block", onclick: (ev) => busy(ev.currentTarget, async () => {
+      const v = input.value.trim();
+      if (!/^\d{1,5}$/.test(v) || +v < 1 || +v > 10000) throw new Error("Скорость: целое число Мбит/с от 1 до 10000");
+      await save(String(+v));
+    }) }, "Сохранить"), input),
+    c.speed ? h("button", { class: "btn-block", onclick: (ev) => busy(ev.currentTarget, () => save("off")) }, "♾ Без ограничения") : null);
   input.focus();
 });
 
@@ -2536,6 +2934,18 @@ route(/^\/client\/([^/]+)\/mimicry$/, async (ctx, name) => {
 });
 
 // ── Новый клиент ──────────────────────────────────────────
+// Случайное имя: 6 букв и цифра (qtrbka7), криптостойко, не из занятых
+function randName(taken) {
+  const pick = (abc) => { const b = new Uint32Array(1); let x;
+    do { crypto.getRandomValues(b); x = b[0]; } while (x >= 4294967296 - 4294967296 % abc.length);
+    return abc[x % abc.length]; };
+  for (;;) {
+    let n = "";
+    for (let i = 0; i < 6; i++) n += pick("abcdefghijklmnopqrstuvwxyz");
+    n += pick("0123456789");
+    if (!taken.has(n)) return n;
+  }
+}
 function expireField() {
   const sel = h("select", {}, EXPIRES.map(([v, l]) => h("option", { value: v }, l)), h("option", { value: "date" }, "📅 До даты…"));
   const date = h("input", { type: "datetime-local", style: "display:none;margin-top:8px" });
@@ -2552,7 +2962,7 @@ function expireField() {
 route(/^\/add$/, async (ctx) => {
   const d = await loadClients();
   const taken = new Set(d.rows.map((c) => c.name));
-  const free = () => { let n = 1; while (taken.has("client" + n)) n++; return "client" + n; };
+  const free = () => randName(taken);
   const name = h("input", { placeholder: "anna_phone", maxlength: 32, autocapitalize: "off", autocomplete: "off" });
   const exp = expireField();
   let spec = "server";
@@ -2878,6 +3288,8 @@ const PARAM_GROUPS = [
     ["RekeyTimeout", "RekeyTimeout", "с"], ["RejectAfterTime", "RejectAfter", "с"], ["KeepaliveTimeout", "Keepalive", "с"],
     ["MaxHandshakeAttempts", "MaxHandshake", "попыток"]]],
 ];
+// Не обязаны совпадать у клиентов: случайные значения для них не ломают старые конфиги
+const PARAM_FREE = ["Мусорные пакеты", "AWG 3.x"];
 const PARAM_SWITCHES = [["RandomTrailers", "RandomTrailers", "хвосты случайной длины — обязаны совпадать у клиентов"],
   ["DisableCookies", "DisableCookies", "сервер не отвечает cookie под нагрузкой — только на сервере"]];
 
@@ -2901,6 +3313,15 @@ route(/^\/server\/params$/, async (ctx) => {
     applyBtn.disabled = !changed.size || (r.errors || []).length > 0;
   }
   const recheck = () => { clearTimeout(timer); timer = setTimeout(() => busy(null, check), 350); };
+  // Кубик: случайные значения от awg2 (server params gen — те же пределы, что при
+  // создании сервера) — только в поля формы; применяет, как и ручную правку, «Применить»
+  const roll = (keys, btn) => busy(btn, async () => {
+    const v = ((await call("server", "params", "gen")) || {}).values || {};
+    keys.forEach((k) => { if (inputs[k] && v[k] != null) { inputs[k].value = v[k]; cur[k] = String(v[k]); } });
+    haptic(); recheck();
+  });
+  const groupKeys = (names) => PARAM_GROUPS.filter(([n]) => names.indexOf(n) >= 0)
+    .reduce((a, [, , keys]) => a.concat(keys.map(([k]) => k)), []).filter((k) => k in orig);
   const field = ([k, label, sub]) => {
     const inp = inputs[k] = h("input", { value: orig[k] || "", autocomplete: "off", autocapitalize: "off", spellcheck: "false",
       inputmode: /^(Jc|Jmin|Jmax|S\d)$/.test(k) ? "numeric" : null, "data-key": k,
@@ -2933,7 +3354,15 @@ route(/^\/server\/params$/, async (ctx) => {
   ctx.put(title("🎛 Параметры AWG", pill("AWG " + (d.proto || "?"), "accent")),
     h("div", { class: "card small muted" }, "S и H обязаны совпадать у сервера и клиентов — после их правки старые конфиги "
       + "не подключатся. Jc/Jmin/Jmax" + (is3 ? ", паддинг данных и таймеры" : "") + " — не обязаны."),
-    PARAM_GROUPS.filter(([, , keys]) => keys.some(([k]) => k in orig)).map(([name, cols, keys]) => [h("h2", {}, name),
+    h("div", { class: "even2 prand" },
+      h("button", { title: "Jc/Jmin/Jmax" + (is3 ? ", паддинг данных, таймеры" : "") + " — старые конфиги продолжат работать",
+        onclick: (ev) => roll(groupKeys(PARAM_FREE), ev.currentTarget) }, "🎲 Кроме S и H"),
+      h("button", { title: "Все поля — S и H тоже: клиентам понадобятся новые конфиги",
+        onclick: (ev) => roll(groupKeys(PARAM_GROUPS.map(([n]) => n)), ev.currentTarget) }, "🎲 Все поля")),
+    PARAM_GROUPS.filter(([, , keys]) => keys.some(([k]) => k in orig)).map(([name, cols, keys]) => [
+      // На 3.x заголовки H — всегда 1-4 (под шифром), кубик им ни к чему
+      h("h2", { class: "pgh" }, name, name === "Заголовки" && is3 ? null : h("button", { class: "pdice", title: "Случайные значения",
+        "aria-label": "Случайно: " + name, onclick: (ev) => roll(groupKeys([name]), ev.currentTarget) }, icon("dices"))),
       h("div", { class: "pgrid", style: `--c:${cols}` }, keys.filter(([k]) => k in orig).map(field))]),
     PARAM_SWITCHES.filter(([k]) => k in orig).map(([k, label, sub]) => switchRow(label, sub, orig[k] === "on", async (on) => {
       cur[k] = on ? "on" : "off"; recheck();
@@ -3006,32 +3435,215 @@ route(/^\/server\/module$/, async (ctx) => {
 const STATE_WORD = { up: "включён", off: "выключен", none: "не настроен" };
 const TUNNELS = [["warp", "☁️", "WARP", "Cloudflare"], ["xray", "🛰", "Xray", "VLESS, VMess, Trojan, SS"],
   ["tun2socks", "🧦", "tun2socks", "внешний SOCKS5"], ["exits", "🚪", "Exit-ноды WG", "другие AWG/WG-серверы"]];
-const TUNNEL_ICON = { warp: "cloud", xray: "satellite", tun2socks: "waypoints", exits: "door-open" };
 const tunnelDown = (t) => `Выключить ${t}? Клиенты, идущие через него, пойдут напрямую через сервер; настройки сохранятся.`;
-route(/^\/tunnels$/, async (ctx) => {
+// Туннели в стиле «Карточки»: вкладки «Туннели», «Exit-ноды», «Xray» со счётчиками,
+// панель 2×2, сводка и карточка на каждый туннель, exit-ноду и выход Xray
+const TUN_NAME = { warp: "WARP", xray: "Xray", tun2socks: "tun2socks", exits: "Exit-ноды WG" };
+const TUN_SHORT = { warp: "WARP", xray: "Xray", tun2socks: "tun2socks", exits: "Exit-ноды" };
+const TUN_DOWN = { warp: ["warp", "down"], xray: ["xray", "down"], tun2socks: ["t2s", "down"], exits: ["exits", "down"] };
+const TUN_DEL = {
+  warp: ["Удалить WARP: аккаунт, профиль, службы?", "WARP удалён", ["warp", "remove"]],
+  xray: ["Удалить Xray: бинарь, конфиг с выходами, службы?", "Xray удалён", ["xray", "remove"]],
+  tun2socks: ["Удалить tun2socks (служба, бинарь, адрес прокси)?", "tun2socks удалён", ["t2s", "remove"]] };
+const TTABS = ["tun", "nodes", "xray"];
+async function tunnelsCards(ctx) {
   const d = (await call("tunnels", "status")) || {};
-  const n = d.cascade || 0;
-  const card = (path, name, st, meta, line) => ecard({ state: st === "up" ? "on" : st === "off" ? "warn" : "", name,
-    onopen: () => go(path), attrs: { "data-name": name },
-    right: pill(STATE_WORD[st] || st || "—", st === "up" ? "ok" : st === "off" ? "warn" : ""), meta, lines: [line] });
-  const configured = TUNNELS.filter(([k]) => d[k] && d[k] !== "none").length;
-  const active = TUNNELS.filter(([k]) => d[k] === "up").map(([, , name]) => name).join(", ");
-  ctx.put(title("Туннели и DNS"),
-    statGrid([
-      [active || "напрямую", "Выход клиентов", "один туннель за раз"],
-      [`${configured}/${TUNNELS.length}`, "Настроено", `каскад ${n} · DNS ${STATE_WORD[d.dns] || "—"}`],
-    ]),
-    h("h2", {}, "Выход клиентов"),
-    TUNNELS.map(([k, , name, sub]) => card("/tunnels/" + k, name, d[k], [tag(sub, "", TUNNEL_ICON[k])], null)),
-    h("h2", {}, "Ещё"),
-    card("/tunnels/cascade", "Каскад портов", n ? "up" : "none", [tag(n ? `правил: ${n}` : "правил нет", n ? "accent" : "", "shuffle")],
-      "порт этого сервера → другой сервер"),
-    card("/tunnels/dns", "Шифрованный DNS", d.dns, [tag("DoH", "", "lock-keyhole"), tag("dnscrypt-proxy")], "DNS клиентов — через DoH, DoT закрыт"),
-    h("button", { class: "btn-danger btn-block", onclick: (ev) => quickAsk(ev.currentTarget, "Выключить все туннели (WARP, Xray, "
-      + "tun2socks, exit-ноды)? Клиенты пойдут напрямую через сервер, настройки сохранятся.", "Туннели выключены",
-    ["tunnels", "panic"]) }, "🚨 Всё напрямую"),
-    hint("Аварийно выключить туннели — если клиенты остались без интернета"));
-});
+  const has = (k) => !!d[k] && d[k] !== "none", soft = (p) => p.catch(() => null);
+  const [wr, xr, tr, er] = await Promise.all([
+    has("warp") ? soft(callR(["warp", "status"])) : null, has("xray") ? soft(callR(["xray", "status"])) : null,
+    has("tun2socks") ? soft(call("t2s", "status")) : null, has("exits") ? soft(callR(["exits", "status"])) : null]);
+  const W = (wr && wr.data) || {}, X = (xr && xr.data) || {}, T = tr || {}, E = (er && er.data) || {};
+  const nodes = E.nodes || [], outs = X.outs || [], ifs = {};
+  (d.ifs || []).forEach((i) => { ifs[i.iface] = i; });
+  const keys = TUNNELS.map(([k]) => k), active = keys.filter((k) => d[k] === "up"), configured = keys.filter(has).length;
+  const exitsUp = d.exits === "up", upN = nodes.filter((n) => n.up).length;
+  let tab = pref("ttab", "tun"), view = kviewOf("tview"), q = "";
+  if (TTABS.indexOf(tab) < 0) tab = "tun";
+
+  // Включить: работает другой туннель — спросить и сначала выключить его (одновременно — только один)
+  async function turnOn(k, b, start) {
+    const other = active.filter((x) => x !== k);
+    if (other.length) {
+      if (!await confirmTg(`Сейчас работает ${other.map((x) => TUN_NAME[x]).join(", ")}, а одновременно — только один туннель. `
+        + `Выключить и включить ${TUN_NAME[k]}?`)) return;
+      if (!await busy(b, async () => { for (const x of other) await callR(TUN_DOWN[x]); return true; })) return;
+    }
+    await start(b);
+  }
+  const turnOff = (k, b) => quickAsk(b, tunnelDown(TUN_NAME[k]), TUN_NAME[k] + " выключен", TUN_DOWN[k]);
+  const START = {
+    warp: () => runJob(ctx, "Включение WARP", ["warp", "up"]),
+    xray: () => runJob(ctx, "Включение Xray", ["xray", "up"]),
+    tun2socks: () => runJob(ctx, "Включение tun2socks", ["t2s", "up", T.proxy]),
+    exits: (b) => busy(b, async () => {
+      const res = await callR(["exits", "up", E.mode === "peers" ? "peers" : "all"]);
+      haptic(); toast("✅ " + outcome(res.log, "Exit-ноды включены"), 3500); render();
+    }),
+  };
+  const trafficKv = (rx, tx) => (view === "grid" ? [["Принято с запуска", "↓ " + fmtBytes(rx)], ["Отдано с запуска", "↑ " + fmtBytes(tx)]] : []);
+
+  // Карточка туннеля: состояние, переключатель, что внутри, трафик интерфейса
+  function engine(k) {
+    const on = d[k] === "up", conf = has(k), lock = on ? "Сначала выключи туннель" : null;
+    let iface, chips = [], kv = [], rx = 0, tx = 0, install, clients = null, canOn = conf, why = null;
+    if (k === "warp") {
+      iface = W.iface || "warp0";
+      chips = [kchip("Cloudflare", "", "cloud"), conf ? kchip(W.backend || "wg") : null, W.health ? kchip("health-check", "ok") : null,
+        W.failed ? kchip("сбой", "bad") : null];
+      kv = [["Сервер", masked(W.endpoint || "")], W.backend === "usque" ? ["Протокол", "MASQUE (HTTP/3)"] : ["Рукопожатие", on ? agoText(W.hs) : "—"]];
+      rx = W.rx || 0; tx = W.tx || 0;
+      install = () => runJob(ctx, "Установка WARP", ["warp", "install"]);
+      clients = "/tunnels/warp/clients";
+    } else if (k === "xray") {
+      const own = (X.clients || []).length, i = ifs.xray0 || {};
+      iface = "xray0";
+      chips = [kchip(`${outs.length} ${plural(outs.length, "выход", "выхода", "выходов")}`, outs.length ? "acc" : ""),
+        X.balancer && X.balancer !== "off" ? kchip(X.balancer, "", "scale") : null, X.ru ? kchip("РФ напрямую") : null];
+      kv = [["По умолчанию", X.main || "—"], ["Свой выход", own ? `у ${own} ${plural(own, "клиента", "клиентов", "клиентов")}` : "ни у кого"]];
+      rx = i.rx || 0; tx = i.tx || 0;
+      install = () => runJob(ctx, "Установка Xray", ["xray", "install"]);
+      clients = "/tunnels/xray/clients";
+      canOn = conf && outs.length > 0; why = conf && !outs.length ? "Сначала добавь выход" : null;
+    } else if (k === "tun2socks") {
+      const i = ifs.tun0 || {};
+      iface = "tun0";
+      chips = [kchip("SOCKS5", "", "waypoints")];
+      kv = [["Прокси", masked(T.proxy || "")]];
+      rx = i.rx || 0; tx = i.tx || 0;
+      install = () => go("/tunnels/tun2socks");
+      canOn = conf && !!T.proxy; why = conf && !T.proxy ? "Сначала укажи прокси" : null;
+    } else {
+      iface = "awg-exit-*";
+      chips = [kchip(`${nodes.length} ${plural(nodes.length, "нода", "ноды", "нод")}`, nodes.length ? "acc" : ""),
+        nodes.length ? kchip(E.mode === "peers" ? "выбранные клиенты" : "все клиенты", "", "users") : null,
+        E.balancer === "ecmp" ? kchip("ECMP", "", "scale") : E.single ? kchip("нода " + E.single) : null];
+      kv = [["Поднято", `${upN} из ${nodes.length}`], ["Кого ведёт", E.mode === "peers" ? "выбранных" : "всех"]];
+      nodes.forEach((n) => { rx += n.rx || 0; tx += n.tx || 0; });
+      install = () => go("/tunnels/exits/add");
+      clients = "/tunnels/exits";
+      canOn = nodes.length > 0; why = !nodes.length ? "Сначала добавь ноду" : null;
+    }
+    const open = () => go("/tunnels/" + k);
+    const state = on ? "on" : !conf ? "none" : W.failed && k === "warp" ? "bad" : "";
+    const del = TUN_DEL[k];
+    return kcard({ view, state, name: TUN_NAME[k], iface, chips, attrs: { "data-name": TUN_NAME[k], "data-tunnel": k }, onopen: open,
+      right: [on && del ? klock("Работает — удалить можно после выключения") : null,
+        conf || k === "exits" ? kswitch(on, (on ? "Выключить " : "Включить ") + TUN_NAME[k],
+          (b) => (on ? turnOff(k, b) : turnOn(k, b, START[k])), !on && !canOn ? why || "Не настроен" : null) : null,
+        kgear("Настройки " + TUN_NAME[k], open)],
+      kv: conf ? kv.concat(trafficKv(rx, tx)) : [], extra: conf ? kTraffic(rx, tx) : null,
+      acts: !conf && k !== "exits" ? [kact(k === "tun2socks" ? "settings" : "package", k === "tun2socks" ? "Настроить" : "Установить", install, "pri"),
+        kact("info", "Подробнее", open)]
+        : [kact("square-pen", "Настроить", open),
+          clients ? kact("users", "Клиенты", () => go(clients)) : kact("file-text", "Журнал", () => go("/log/tun2socks")),
+          del ? kact("trash-2", "Удалить", (b) => quickAsk(b, ...del), "bad", lock)
+            : kact("plus", "Нода", () => go("/tunnels/exits/add"))] });
+  }
+  const nodeCard = (n) => kcard({ view, state: n.up ? "on" : exitsUp ? "bad" : "", name: n.name, iface: "awg-exit-" + n.name,
+    attrs: { "data-name": "node-" + n.name }, onopen: () => go("/tunnels/exits"),
+    chips: [kchip(n.proto === "awg" ? "AWG" : "WG", n.proto === "awg" ? "acc" : ""),
+      E.balancer === "ecmp" ? kchip("ECMP", "", "scale") : E.single === n.name ? kchip("основная", "ok") : null,
+      n.up ? null : kchip(exitsUp ? "лежит" : "выключена", exitsUp ? "bad" : "")],
+    kv: [["Сервер", masked(n.endpoint || "")], ["Рукопожатие", n.up ? agoText(n.hs) : "—"]].concat(trafficKv(n.rx || 0, n.tx || 0)),
+    extra: kTraffic(n.rx || 0, n.tx || 0),
+    acts: [kact("users", "Клиенты", () => go("/tunnels/exits")), kact("file-text", "Журнал", () => go("/log/exits")),
+      kact("trash-2", "Удалить", (b) => quickAsk(b, `Удалить ноду ${n.name}? Её клиенты перейдут на общий выход.`,
+        `Нода ${n.name} удалена`, ["exits", "del", n.name]), "bad")] });
+  const ownOut = (t) => (X.clients || []).filter((c) => c.out === t).length;
+  function outCard(o) {
+    const main = X.main === o.tag, bal = !!X.balancer && X.balancer !== "off", own = ownOut(o.tag);
+    const last = main && d.xray === "up" && outs.length === 1 ? "Единственный выход работающего Xray — сначала выключи Xray" : null;
+    return kcard({ view, state: d.xray === "up" && (main || bal || own) ? "on" : "", name: o.tag, iface: "xray0 · " + o.proto,
+      attrs: { "data-name": "xo-" + o.tag }, onopen: () => go("/tunnels/xray"),
+      chips: [kchip(String(o.proto).toUpperCase(), "acc"), o.sec && o.sec !== "none" ? kchip(String(o.sec).toUpperCase()) : null,
+        o.net ? kchip(String(o.net).toUpperCase()) : null, main ? kchip("по умолчанию", "ok") : null],
+      right: last ? [klock(last)] : null,
+      kv: [["Сервер", masked(o.host ? o.host + (o.port ? ":" + o.port : "") : "")],
+        ["Свой выход", own ? `у ${own} ${plural(own, "клиента", "клиентов", "клиентов")}` : "ни у кого"]],
+      acts: [main ? kact("circle-check", "Основной", () => {}, null, "Уже выход по умолчанию")
+        : kact("circle-check", "Основным", (b) => quick(b, "Выход по умолчанию: " + o.tag, ["xray", "main", o.tag])),
+      kact("users", "Клиенты", () => go("/tunnels/xray/clients")),
+      kact("trash-2", "Удалить", (b) => quickAsk(b, `Удалить выход ${o.tag}?`, "Выход удалён", ["xray", "del", o.tag]), "bad", last)] });
+  }
+  // Каскад портов и шифрованный DNS — коротко, под туннелями
+  const extraCards = () => [
+    kcard({ view: "list", state: d.cascade ? "on" : "none", name: "Каскад портов", iface: "порт → другой сервер",
+      attrs: { "data-name": "Каскад портов" }, onopen: () => go("/tunnels/cascade"),
+      chips: [kchip(d.cascade ? `правил: ${d.cascade}` : "правил нет", d.cascade ? "acc" : "", "shuffle")],
+      right: [kgear("Каскад портов", () => go("/tunnels/cascade"))] }),
+    kcard({ view: "list", state: d.dns === "up" ? "on" : d.dns === "off" ? "warn" : "none", name: "Шифрованный DNS", iface: "dnscrypt-proxy",
+      attrs: { "data-name": "Шифрованный DNS" }, onopen: () => go("/tunnels/dns"),
+      chips: [kchip("DoH", "", "lock-keyhole"), kchip(STATE_WORD[d.dns] || "—", d.dns === "up" ? "ok" : d.dns === "off" ? "warn" : "")],
+      right: [kgear("Шифрованный DNS", () => go("/tunnels/dns"))] })];
+
+  async function add() {
+    if (tab === "nodes") return go("/tunnels/exits/add");
+    if (tab === "xray") return has("xray") ? go("/tunnels/xray/add") : runJob(ctx, "Установка Xray", ["xray", "install"]);
+    const v = await sheet("Добавить", [
+      { label: "🚪 Exit-нода WG — другой AWG/WG-сервер", value: "/tunnels/exits/add" },
+      has("xray") ? { label: "🛰 Выход Xray — ссылкой", value: "/tunnels/xray/add" } : { label: "🛰 Установить Xray", value: "xray" },
+      has("warp") ? null : { label: "☁️ Установить WARP", value: "warp" },
+      has("tun2socks") ? null : { label: "🧦 tun2socks — внешний SOCKS5", value: "/tunnels/tun2socks" }].filter(Boolean));
+    if (v === "xray") runJob(ctx, "Установка Xray", ["xray", "install"]);
+    else if (v === "warp") runJob(ctx, "Установка WARP", ["warp", "install"]);
+    else if (v) go(v);
+  }
+  const panic = (b) => quickAsk(b, "Выключить все туннели (WARP, Xray, tun2socks, exit-ноды)? Клиенты пойдут напрямую через сервер, "
+    + "настройки сохранятся.", "Туннели выключены", ["tunnels", "panic"]);
+
+  const total = (o) => (o.rx || 0) + (o.tx || 0);
+  const flows = [["WARP", W], ["Xray", ifs.xray0 || {}], ["tun2socks", ifs.tun0 || {}]].concat(nodes.map((n) => ["нода " + n.name, n]));
+  const sumRx = flows.reduce((a, f) => a + (f[1].rx || 0), 0), sumTx = flows.reduce((a, f) => a + (f[1].tx || 0), 0);
+  const lead = flows.filter((f) => total(f[1]) > 0).sort((a, b) => total(b[1]) - total(a[1]))[0];
+
+  const tabsBox = h("div"), lineBox = h("div"), segBox = h("div"), listBox = h("div");
+  const search = h("input", { type: "search", placeholder: "Поиск", "aria-label": "Поиск", autocomplete: "off",
+    oninput: () => { q = search.value.trim().toLowerCase(); drawList(); } });
+  const addBtn = h("button", { class: "btn-primary", onclick: add }, icon("plus"), "Добавить");
+  function drawList() {
+    // Карточка — [текст для поиска, построитель]: ищем по имени, интерфейсу, протоколу, адресу
+    const rank = (k) => (d[k] === "up" ? 0 : has(k) || (k === "exits" && nodes.length) ? 1 : 2);
+    const items = tab === "tun" ? keys.slice().sort((a, b) => rank(a) - rank(b)).map((k) => [`${TUN_NAME[k]} ${k}`, () => engine(k)])
+      : tab === "nodes" ? nodes.map((n) => [`${n.name} awg-exit-${n.name} ${n.proto} ${n.endpoint || ""}`, () => nodeCard(n)])
+        : outs.map((o) => [`${o.tag} ${o.proto} ${o.sec} ${o.net} ${o.host}`, () => outCard(o)]);
+    const vis = items.filter(([t]) => !q || t.toLowerCase().indexOf(q) >= 0);
+    const empty = (text, btn) => h("div", { class: "kempty" }, h("div", {}, text), btn || null);
+    listBox.replaceChildren(...[
+      vis.length ? h("div", { class: "klist" }, vis.map(([, mk]) => mk()))
+        : q ? empty("Ничего не нашлось")
+          : tab === "nodes" ? empty("Нод нет — клиенты могут выходить в интернет через другие AWG/WG-серверы",
+            h("button", { class: "btn-primary", onclick: () => go("/tunnels/exits/add") }, icon("plus"), "Добавить ноду"))
+            : !has("xray") ? empty("Xray не установлен — выходы VLESS, VMess, Trojan, Shadowsocks, Hysteria2",
+              h("button", { class: "btn-primary", onclick: () => runJob(ctx, "Установка Xray", ["xray", "install"]) }, icon("package"), "Установить Xray"))
+              : empty("Выходов нет — добавь ссылкой", h("button", { class: "btn-primary", onclick: () => go("/tunnels/xray/add") }, icon("plus"), "Добавить выход")),
+      tab === "tun" && !q ? [h("div", { class: "ksec" }, h("h2", {}, "Ещё")), h("div", { class: "klist" }, extraCards()),
+        hint("Одновременно работает один туннель: включишь другой — текущий выключится.")] : null,
+      tab === "xray" && outs.length > 1 && !q ? hint(X.per_client ? "Клиенту можно закрепить свой выход: Клиенты → клиент → Маршрут."
+        : "Свой выход клиенту — только с inbound tun в самом Xray: обнови Xray.") : null].flat(Infinity).filter(Boolean));
+  }
+  function draw() {
+    tabsBox.replaceChildren(ktabs([["tun", "Туннели", configured], ["nodes", "Exit-ноды", nodes.length], ["xray", "Xray", outs.length]], tab,
+      (k) => { tab = k; setPref("ttab", k); draw(); }));
+    lineBox.replaceChildren(kline(tab === "tun" ? `${configured} из ${keys.length} настроено · ${active.length ? "работает " + active.map((k) => TUN_SHORT[k]).join(", ") : "все напрямую"}`
+      : tab === "nodes" ? `${nodes.length} ${plural(nodes.length, "нода", "ноды", "нод")} · поднято ${upN}`
+        : `${outs.length} ${plural(outs.length, "выход", "выхода", "выходов")}` + (X.balancer && X.balancer !== "off" ? ` · балансировщик ${X.balancer}` : "")));
+    segBox.replaceChildren(segBar(KVIEWS, view, (v) => { view = v; setPref("tview", v); draw(); }));
+    addBtn.lastChild.textContent = tab === "nodes" ? "Нода" : tab === "xray" ? (has("xray") ? "Выход" : "Установить") : "Добавить";
+    drawList();
+  }
+  ctx.put(khead("Туннели"), tabsBox, lineBox,
+    h("div", { class: "ktools" }, h("div", { class: "search" }, icon("search"), search), segBox,
+      h("button", { class: "btn-danger", disabled: active.length ? null : true, title: active.length ? null : "Все и так напрямую", onclick: (ev) => panic(ev.currentTarget) },
+        icon("siren"), "Всё напрямую"), addBtn),
+    kstats([
+      [active.length ? active.map((k) => TUN_SHORT[k]).join(", ") : "напрямую", "Выход клиентов", "один туннель за раз"],
+      [`${configured}/${keys.length}`, "Настроено", `каскад ${d.cascade || 0} · DNS ${{ up: "вкл", off: "выкл" }[d.dns] || "нет"}`],
+      [fmtBytes(sumRx + sumTx), "Обмен с запуска", rxtx(sumRx, sumTx)],
+      [lead ? lead[0] : "—", "Лидер", lead ? fmtBytes(total(lead[1])) : "трафика нет"]]),
+    listBox);
+  draw();
+}
+route(/^\/tunnels$/, (ctx) => tunnelsCards(ctx));
 
 // Кто из клиентов идёт через туннель (WARP, Xray)
 route(/^\/tunnels\/(warp|xray)\/clients$/, async (ctx, kind) => {
@@ -3223,6 +3835,15 @@ route(/^\/tunnels\/tun2socks$/, async (ctx) => {
 route(/^\/tunnels\/exits$/, async (ctx) => {
   const [r, cl] = await Promise.all([callR(["exits", "status"]), loadClients().catch(() => ({ rows: [] }))]);
   const d = r.data || {}, nodes = d.nodes || [], up = !!d.up, mode = d.mode === "peers" ? "peers" : "all";
+  // Журнал — сразу, а проверка выхода в интернет через ноды (до 5 с на ноду) дописывает его следом
+  let logBox = logCard(r.log);
+  if (nodes.some((n) => n.up)) {
+    callR(["exits", "status", "check"]).then((c) => {
+      if (!ctx.live() || !logBox.isConnected) return;
+      const next = logCard(c.log);
+      logBox.replaceWith(next); logBox = next;
+    }).catch(() => {});
+  }
   // Выход каждого клиента в режиме «выбранные»: off — напрямую, shared — общий выход, иначе нода
   const rows = (cl.rows || []).map((c) => ({ name: c.name, ip: c.ip, online: c.online, exit: c.exit == null ? "shared" : c.exit }));
   const label = (v) => (v === "shared" ? "общий выход" : "нода " + v);
@@ -3304,7 +3925,7 @@ route(/^\/tunnels\/exits$/, async (ctx) => {
     h("div", { class: "actions", style: "margin-top:8px" },
       nodes.length ? btn("⚖️ Балансировка", balance) : null,
       btn("📜 Журнал", () => go("/log/exits"))),
-    logCard(r.log));
+    logBox);
 });
 
 route(/^\/tunnels\/exits\/add$/, async (ctx) => {
@@ -3831,7 +4452,7 @@ route(/^\/wgobf$/, async (ctx) => {
 route(/^\/wgobf\/add$/, async (ctx) => {
   const rows = (await call("wgobf", "clients")) || [];
   const taken = new Set(rows.map((c) => c.name));
-  const free = () => { let n = 1; while (taken.has("client" + n)) n++; return "client" + n; };
+  const free = () => randName(taken);
   const name = h("input", { placeholder: "keenetic_home", maxlength: 32, autocapitalize: "off", autocomplete: "off" });
   ctx.put(title("Новый клиент"), hint("Клиент WG + обфускатор — комплект со ссылкой для Keenetic и конфигами."),
     h("label", {}, "Имя — латиница, цифры, _ и -, до 32"),
@@ -3952,7 +4573,7 @@ route(/^\/bot$/, async (ctx) => {
       d.owner ? menuItem("👮 Админы", `владельцев ${d.owners}, приглашённых ${d.invited}`, () => go("/bot/admins")) : null,
       d.owner && !WEB ? menuItem("🎨 Оформление", "иконки custom emoji в боте", () => go("/bot/look")) : null,
       d.owner ? menuItem("📱 Mini App и сертификат", w.running ? w.url : "не запущена", () => go("/bot/app")) : null,
-      d.owner ? menuItem("🔔 Уведомления", "awg0, перезагрузка, ядро, новая версия, диск", () => go("/bot/alerts")) : null),
+      d.owner ? menuItem("🔔 Уведомления", "awg0, перезагрузка, ядро, новая версия, диск, поддержка", () => go("/bot/alerts")) : null),
     d.owner ? btn("🗑 Удалить бота", async () => {
       if (!await confirmTg("Удалить бота: службу, код и конфиг с токеном? AWG не затрагивается, конфиг копируется в бэкапы.")) return;
       if (!await confirmTg("Точно удалить? Панель и бот перестанут работать.")) return;
@@ -3971,6 +4592,7 @@ const ALERT_HINTS = {
   kernel: "apt поставил ядро, под которое модуль AWG не собрался",
   cert: "сертификат панели скоро истечёт — продление не сработало",
   disk: "место на диске почти кончилось",
+  support: "по пятницам, раз в неделю — ссылка, чтобы поддержать проект; только владельцу",
 };
 route(/^\/bot\/alerts$/, async (ctx) => {
   const a = await post("/api/alerts");

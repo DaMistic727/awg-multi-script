@@ -53,6 +53,8 @@ client_delete() {
   [[ -n "$name" ]] && rm -f "$CLIENT_DIR/${name}_awg2.conf" "$CLIENT_DIR/${name}_awg3.conf"
   rm -f "$EXPIRE_STATE_DIR/warn1h_${pub//[^A-Za-z0-9]/_}"
   [[ -n "$ip" ]] && tunnel_peers_forget "$ip"
+  # Полоса скорости удалённого не должна достаться новому клиенту с тем же адресом
+  speed_check
   log_info "клиент удалён: ${name:-?} ($pub)"
   ok "Удалён: ${name:-без имени}"
 }
@@ -247,10 +249,12 @@ _client_mimicry() {
 
 do_add_client() {
   server_exists || { err "Сервер не создан"; return 1; }
-  local name addr ip expire base
+  local name addr ip expire base rnd
   while true; do
-    read_line name "${C}  Имя клиента (латиница, цифры, _ -): ${N}"
-    [[ -z "$name" ]] && return 0
+    rnd=$(rand_client_name) || rnd=""
+    read_line name "${C}  Имя клиента (латиница, цифры, _ -)${rnd:+; Enter — случайное ${rnd}}; 0 — отмена: ${N}"
+    [[ "$name" == 0 ]] && return 0
+    [[ -z "$name" ]] && { [[ -n "$rnd" ]] || return 0; name="$rnd"; }
     _name_free "$name" && break
     valid_client_name "$name" && warn "Клиент $name уже есть" || warn "Имя: латиница, цифры, _ и -, до 32 символов"
   done
@@ -407,7 +411,7 @@ do_list_clients() {
   done < <(traffic_rows)
   echo ""
   hdr "Клиенты"
-  while IFS='|' read -r name pub aip exp orig _; do
+  while IFS='|' read -r name pub aip exp orig _ _ _ sp slow sby; do
     i=$((i + 1))
     ep="" hs=0 rx=0 tx=0
     read -r ep hs rx tx < <(awk -F'\t' -v k="$pub" '$1 == k {print $3, $5, $6, $7; exit}' <<< "$dump") || true
@@ -425,6 +429,8 @@ do_list_clients() {
     (( ${month:-0} )) && echo -e "     ${D}за месяц $(fmt_bytes "$month"), сегодня $(fmt_bytes "${today:-0}")${N}"
     if [[ "$by" == traffic ]]; then echo -e "     ${R}заблокирован: исчерпан лимит — $(limit_fmt "$lim/$per" "$used")${N}"
     elif [[ "${lim:-0}" != 0 ]]; then echo -e "     ${D}лимит: $(limit_fmt "$lim/$per" "$used")${N}"; fi
+    sp=$(speed_fmt "$sp" "$slow" "$sby")
+    [[ -n "$sp" ]] && echo -e "     ${D}скорость: $sp${N}"
     if [[ -n "$exp" ]]; then
       if [[ -n "$orig" && "$by" != traffic ]]; then echo -e "     ${R}заблокирован: срок истёк $(expire_fmt "$exp")${N}"
       elif [[ -z "$orig" ]]; then echo -e "     ${Y}срок: $(expire_fmt "$exp")${N}"; fi
@@ -467,7 +473,7 @@ do_clients_menu() {
     echo -e "  ${C}4)${N} Показать QR"
     echo -e "  ${C}5)${N} Переименовать"
     echo -e "  ${G}6)${N} Создать несколько"
-    echo -e "  ${C}7)${N} Сроки и лимиты трафика"
+    echo -e "  ${C}7)${N} Сроки, лимиты и скорость"
     echo -e "  ${C}8)${N} Экспорт всех (zip)"
     echo -e "  ${C}9)${N} Сменить мимикрию"
     echo -e "  ${R}10)${N} Удалить"

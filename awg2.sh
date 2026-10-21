@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.35"
+VERSION="v1.2.40"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -280,10 +280,17 @@ rand_range() {
   echo $(( lo + r % span ))
 }
 
-rand_name() {  # xkqve_73
+rand_name() {  # qtrbka7 — 6 букв и цифра (SRANDOM — криптостойкий)
   local a='abcdefghijklmnopqrstuvwxyz' s='' i
-  for i in 1 2 3 4 5; do s+="${a:$(rand_range 0 25):1}"; done
-  printf '%s_%02d\n' "$s" "$(rand_range 0 99)"
+  for i in 1 2 3 4 5 6; do s+="${a:$(rand_range 0 25):1}"; done
+  printf '%s%d\n' "$s" "$(rand_range 0 9)"
+}
+
+# Случайное имя, которого нет среди клиентов.
+rand_client_name() {
+  local n i
+  for i in 1 2 3 4 5 6 7 8; do n=$(rand_name); _name_free "$n" && { echo "$n"; return 0; }; done
+  return 1
 }
 
 fmt_duration() {  # 5с / 3м12с / 2ч15м / 3д4ч
@@ -1286,16 +1293,16 @@ mod_built_for() { modinfo -k "$1" "$MOD_NAME" &>/dev/null; }
 # случай «исходники обновили, а пересобрать забыли».
 mod_stale() {
   mod_loaded || return 1
-  local ko live disk newest=0 t kt
+  local ko live disk newest kt
   ko=$(modinfo -n "$MOD_NAME" 2>/dev/null) || return 1
   [[ -f "$ko" ]] || return 1
   live=$(cat "/sys/module/$MOD_NAME/srcversion" 2>/dev/null || true)
   disk=$(modinfo -F srcversion "$ko" 2>/dev/null || true)
   [[ -n "$live" && -n "$disk" && "$live" != "$disk" ]] && return 0
-  for t in "$MOD_SRC_DIR"/*.[ch]; do
-    [[ -f "$t" ]] || continue
-    t=$(stat -c %Y "$t"); (( t > newest )) && newest=$t
-  done
+  # Самый новый файл исходников — одним stat, а не процессом на каждый из десятков
+  # файлов: reboot_reason зовут сводка и server info на каждом экране панели
+  newest=$(stat -c %Y "$MOD_SRC_DIR"/*.[ch] 2>/dev/null | sort -n | tail -1)
+  [[ "$newest" =~ ^[0-9]+$ ]] || newest=0
   kt=$(stat -c %Y "$ko" 2>/dev/null || echo 0)
   (( newest > 0 && kt > 0 && newest > kt ))
 }
@@ -2011,6 +2018,26 @@ gen_awg_params() {
   _check_mtu_headroom "$S4"
 }
 
+# Случайные значения для формы параметров (бот, панель, «кубик»): ничего не
+# пишет и не применяет — дальше обычная проверка (params check) и запись.
+# Диапазоны — генератора (lite — как AmneziaVPN, pro — от допустимого минимума
+# до разумного верха), версия — текущая сервера. MTU сервера не трогается:
+# набор, которому не хватает запаса до него, перебирается заново.
+PARAMS_GEN=""
+params_gen() {  # ПРОФИЛЬ → PARAMS_GEN («ключ<TAB>значение», без HeaderProtectionKey)
+  local profile="$1" proto mtu s4 tries=0
+  proto=$(server_proto); mtu=$(conf_iface_get MTU)
+  while :; do
+    # Пустой MTU — генератор не спрашивает про его снижение
+    MTU="" gen_awg_params "$profile" "$proto" || return 1
+    [[ "$mtu" =~ ^[0-9]+$ ]] || break
+    s4=$(sed -n 's/^S4 = //p' <<< "$AWG_PARAMS")
+    (( mtu + AWG_MTU_OVERHEAD + ${s4:-0} + AWG3_CPA_MAX <= 1500 - AWG_MTU_SAFETY )) && break
+    (( ++tries < 20 )) || break
+  done
+  PARAMS_GEN=$(sed -n 's/^\([A-Za-z0-9]*\) = \(.*\)$/\1\t\2/p' <<< "$AWG_PARAMS" | grep -v '^HeaderProtectionKey' || true)
+}
+
 # MTU без запаса до пути в 1500 даёт не обрыв, а загадочную просадку скорости:
 # крупные пакеты режутся, а PMTU discovery по UDP работает не везде.
 _check_mtu_headroom() {
@@ -2596,7 +2623,7 @@ proto31_cached() {
   bin=$(command -v awg) || return 1
   key="$(mod_tag)|$(stat -c %s:%Y "$bin" 2>/dev/null)|$(cat "/sys/module/$MOD_NAME/srcversion" 2>/dev/null)"
   if [[ -f "$f" ]] && IFS=$'\t' read -r k v < "$f" && [[ "$k" == "$key" && "$v" =~ ^[01]$ ]]; then
-    _PROTO_PROBE[31]=$v           # proto_upgrade_hint в том же вызове не пробует заново
+    _PROTO_PROBE[31]=$v           # повторный вопрос в том же вызове (server info) не пробует заново
     return "$v"
   fi
   proto_supported 3.1 || rc=$?
@@ -3097,17 +3124,6 @@ mimicry_module_warnings() {
   return 0
 }
 
-# Подсказка для шапки: предложить переход на 3.1.
-proto_upgrade_hint() {
-  server_exists || return 0
-  [[ "$(server_proto)" == 3.1 ]] && return 0
-  if proto_supported 3.1; then
-    echo -e "${G}⬆ доступен переход на AWG 3.1${N} ${D}— Сервер → Протокол${N}"
-  else
-    echo -e "${Y}для AWG 3.1 обнови модуль${N} ${D}— Сервер → Модуль ядра${N}"
-  fi
-}
-
 # Снимок конфигов сервера и клиентов — откат, если awg0 не поднимется.
 _params_snapshot() {  # ПЕРЕМЕННАЯ
   local __d f
@@ -3457,6 +3473,8 @@ client_delete() {
   [[ -n "$name" ]] && rm -f "$CLIENT_DIR/${name}_awg2.conf" "$CLIENT_DIR/${name}_awg3.conf"
   rm -f "$EXPIRE_STATE_DIR/warn1h_${pub//[^A-Za-z0-9]/_}"
   [[ -n "$ip" ]] && tunnel_peers_forget "$ip"
+  # Полоса скорости удалённого не должна достаться новому клиенту с тем же адресом
+  speed_check
   log_info "клиент удалён: ${name:-?} ($pub)"
   ok "Удалён: ${name:-без имени}"
 }
@@ -3651,10 +3669,12 @@ _client_mimicry() {
 
 do_add_client() {
   server_exists || { err "Сервер не создан"; return 1; }
-  local name addr ip expire base
+  local name addr ip expire base rnd
   while true; do
-    read_line name "${C}  Имя клиента (латиница, цифры, _ -): ${N}"
-    [[ -z "$name" ]] && return 0
+    rnd=$(rand_client_name) || rnd=""
+    read_line name "${C}  Имя клиента (латиница, цифры, _ -)${rnd:+; Enter — случайное ${rnd}}; 0 — отмена: ${N}"
+    [[ "$name" == 0 ]] && return 0
+    [[ -z "$name" ]] && { [[ -n "$rnd" ]] || return 0; name="$rnd"; }
     _name_free "$name" && break
     valid_client_name "$name" && warn "Клиент $name уже есть" || warn "Имя: латиница, цифры, _ и -, до 32 символов"
   done
@@ -3811,7 +3831,7 @@ do_list_clients() {
   done < <(traffic_rows)
   echo ""
   hdr "Клиенты"
-  while IFS='|' read -r name pub aip exp orig _; do
+  while IFS='|' read -r name pub aip exp orig _ _ _ sp slow sby; do
     i=$((i + 1))
     ep="" hs=0 rx=0 tx=0
     read -r ep hs rx tx < <(awk -F'\t' -v k="$pub" '$1 == k {print $3, $5, $6, $7; exit}' <<< "$dump") || true
@@ -3829,6 +3849,8 @@ do_list_clients() {
     (( ${month:-0} )) && echo -e "     ${D}за месяц $(fmt_bytes "$month"), сегодня $(fmt_bytes "${today:-0}")${N}"
     if [[ "$by" == traffic ]]; then echo -e "     ${R}заблокирован: исчерпан лимит — $(limit_fmt "$lim/$per" "$used")${N}"
     elif [[ "${lim:-0}" != 0 ]]; then echo -e "     ${D}лимит: $(limit_fmt "$lim/$per" "$used")${N}"; fi
+    sp=$(speed_fmt "$sp" "$slow" "$sby")
+    [[ -n "$sp" ]] && echo -e "     ${D}скорость: $sp${N}"
     if [[ -n "$exp" ]]; then
       if [[ -n "$orig" && "$by" != traffic ]]; then echo -e "     ${R}заблокирован: срок истёк $(expire_fmt "$exp")${N}"
       elif [[ -z "$orig" ]]; then echo -e "     ${Y}срок: $(expire_fmt "$exp")${N}"; fi
@@ -3871,7 +3893,7 @@ do_clients_menu() {
     echo -e "  ${C}4)${N} Показать QR"
     echo -e "  ${C}5)${N} Переименовать"
     echo -e "  ${G}6)${N} Создать несколько"
-    echo -e "  ${C}7)${N} Сроки и лимиты трафика"
+    echo -e "  ${C}7)${N} Сроки, лимиты и скорость"
     echo -e "  ${C}8)${N} Экспорт всех (zip)"
     echo -e "  ${C}9)${N} Сменить мимикрию"
     echo -e "  ${R}10)${N} Удалить"
@@ -3965,8 +3987,16 @@ traffic_tick() {  # [1 — записать базу сейчас]
       UNLIMIT)
         echo "$(date '+%F %T') unlimit: $name ($arg)" >> "$EXPIRE_LOG"
         _expire_notify "✅ Клиент <b>$(_expire_esc "$name")</b> разблокирован — трафик в пределах лимита: ${arg}." ;;
+      SLOW)
+        echo "$(date '+%F %T') slow: $name до $arg Мбит/с ($text)" >> "$EXPIRE_LOG"
+        _expire_notify "🐢 Клиент <b>$(_expire_esc "$name")</b> замедлен до ${arg} Мбит/с: исчерпан лимит трафика — ${text}." ;;
+      UNSLOW)
+        echo "$(date '+%F %T') unslow: $name ($arg)" >> "$EXPIRE_LOG"
+        _expire_notify "✅ Клиент <b>$(_expire_esc "$name")</b> — снова полная скорость: трафик в пределах лимита — ${arg}." ;;
     esac
   done <<< "$out"
+  # Замедление по лимиту и своя скорость клиентов — в tc
+  speed_check
   return 0
 }
 
@@ -4024,7 +4054,9 @@ expire_install() {
   mkdir -p "$EXPIRE_STATE_DIR"
   emit_script "$EXPIRE_BIN" 'expire_check_run' \
     SERVER_CONF AWG_IF EXPIRE_SUSPEND_IP EXPIRE_STATE_DIR EXPIRE_LOG BOT_CONF BOT_ADMINS TRAFFIC_DB _PY_HELPER STATE_DIR EXPIRE_LOCK_MAX \
-    py _expire_notify _expire_esc _expire_sync _traffic_snapshot traffic_tick expire_check_run || return 1
+    SPEED_IFB SPEED_H SPEED_MAX SPEED_ERR \
+    py _expire_notify _expire_esc _expire_sync _traffic_snapshot traffic_tick expire_check_run \
+    _speed_root _speed_burst _speed_batch _speed_undo _speed_build speed_clear speed_apply speed_check || return 1
   write_unit awg2-expire.service <<EOF
 [Unit]
 Description=AWG Toolza — сроки и трафик клиентов
@@ -4080,6 +4112,7 @@ expire_watchdog() {
 }
 
 expire_remove() {
+  speed_clear
   remove_unit awg2-expire.timer awg2-expire.service
   rm -f "$EXPIRE_BIN" "$TRAFFIC_DB" "$TRAFFIC_DB.lock"
   rm -rf "$EXPIRE_STATE_DIR"
@@ -4137,17 +4170,17 @@ do_traffic_days() {
 do_expire_menu() {
   server_exists || { err "Сервер не создан"; return 1; }
   expire_install
-  local c name pub ts rows=() n=0 exp orig lim per used month _ by ans
+  local c name pub ts rows=() n=0 exp orig lim per used month _ by ans sp slow sby
   local -A tl=()
   while true; do
     echo ""
-    hdr "Сроки и лимиты трафика"
+    hdr "Сроки, лимиты трафика и скорость"
     tl=()
     while IFS='|' read -r name lim per used month _ by; do
       [[ -n "$name" && "$lim" != 0 ]] && tl[x$name]="$lim/$per|$used|$by"
     done < <(traffic_rows)
-    while IFS='|' read -r name pub _ exp orig _; do
-      [[ -n "$exp" || -n "${tl[x$name]:-}" ]] || continue
+    while IFS='|' read -r name pub _ exp orig _ _ _ sp slow sby; do
+      [[ -n "$exp" || -n "${tl[x$name]:-}" || -n "$sp" ]] || continue
       n=$((n + 1))
       by="${tl[x$name]:-}"; by="${by##*|}"
       if [[ -n "$orig" && "$by" == traffic ]]; then echo -e "  ${R}🚫 ${name}${N} ${D}— заблокирован: исчерпан лимит${N}"
@@ -4156,10 +4189,12 @@ do_expire_menu() {
       else echo -e "  ${C}📶 ${name}${N}"; fi
       if [[ -n "${tl[x$name]:-}" ]]; then
         IFS='|' read -r lim used _ <<< "${tl[x$name]}"
-        echo -e "     ${D}трафик: $(limit_fmt "$lim" "$used")${N}"
+        echo -e "     ${D}трафик: $(limit_fmt "$lim" "$used")${slow:+, исчерпал — замедлять до $slow Мбит/с}${N}"
       fi
+      sp=$(speed_fmt "$sp" "$slow" "$sby")
+      [[ -n "$sp" ]] && echo -e "     ${D}скорость: $sp${N}"
     done < <(clients_psv)
-    (( n )) || echo -e "  ${D}Сроков и лимитов нет — все клиенты бессрочные и без лимита${N}"
+    (( n )) || echo -e "  ${D}Сроков, лимитов и ограничений скорости нет${N}"
     n=0
     echo ""
     echo -e "  ${C}1)${N} Поставить срок"
@@ -4169,8 +4204,9 @@ do_expire_menu() {
     echo -e "  ${C}5)${N} Обнулить счётчик лимита"
     echo -e "  ${C}6)${N} Трафик по дням"
     echo -e "  ${R}7)${N} Удалить с истёкшим сроком"
+    echo -e "  ${C}8)${N} Скорость клиента"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-7]: ${N}" 0 7 0
+    read_choice c "${C}  Выбор [0-8]: ${N}" 0 8 0
     case "$c" in
       1) _pick_client || continue
          name="${CHOSEN%%$'\t'*}"
@@ -4183,7 +4219,10 @@ do_expire_menu() {
          name="${CHOSEN%%$'\t'*}"
          [[ -n "$name" ]] || { warn "У клиента нет имени"; continue; }
          ans=$(_ask_limit)
-         [[ -n "$ans" ]] && { client_limit_set "$name" "${ans% *}" "${ans#* }" || true; } ;;
+         [[ -n "$ans" ]] || continue
+         client_limit_set "$name" "${ans% *}" "${ans#* }" || continue
+         ans=$(_ask_limit_mode)
+         client_limit_mode "$name" "$ans" || true ;;
       4) _pick_client || continue
          client_limit_set "${CHOSEN%%$'\t'*}" off || true ;;
       5) _pick_client || continue
@@ -4193,9 +4232,258 @@ do_expire_menu() {
          (( ${#rows[@]} )) || { info "Клиентов с истёкшим сроком нет"; continue; }
          warn "Будут удалены навсегда: ${rows[*]}"
          read_confirm "${R}  Подтверди (введи yes): ${N}" && clients_purge_blocked ;;
+      8) _pick_client || continue
+         name="${CHOSEN%%$'\t'*}"
+         [[ -n "$name" ]] || { warn "У клиента нет имени"; continue; }
+         ans=$(_ask_speed)
+         [[ -n "$ans" ]] && { client_speed_set "$name" "$ans" || true; } ;;
       0) return 0 ;;
     esac
   done
+}
+
+# ═════ speed ═════
+# Скорость клиентов — одна цифра (Мбит/с) на оба направления.
+#
+# Скачивание (сервер → клиент): HTB на выходе awg0, у каждого клиента своя
+# полоса по его адресу в VPN, внутри — fq_codel. Отдача (клиент → сервер):
+# Linux выравнивает только исходящую очередь, поэтому вход awg0 по адресам
+# ограниченных клиентов перенаправляется в ifb-интерфейс и режется там тем же
+# HTB. Нет модуля ifb — отдача режется полисером на входе awg0 (грубее).
+# Весь трафик клиента проходит через awg0, поэтому скорость действует при
+# любом маршруте: напрямую, WARP, Xray, exit-ноды.
+#
+# Метки клиента в конфиге сервера:
+#   # speed=N        постоянная скорость, Мбит/с;
+#   # limit_slow=N   исчерпал лимит трафика — не блокировать, а замедлять до N;
+#   # slowed_by=traffic  сейчас замедлен (ставит и снимает таймер лимитов).
+# Таймер сроков (каждые 15 с) сверяет план с тем, что стоит в tc, и ставит
+# заново после перезапуска awg0 или перезагрузки — хуков в конфиге сервера
+# не нужно. Клиенты без ограничений идут через awg0 как раньше; пока
+# ограничений нет ни у кого, tc на awg0 не трогается вовсе.
+
+SPEED_IFB="${AWG_IF}-ifb"
+SPEED_H="a2"             # свой handle корня: чужую очередь (поставленную руками) не трогаем
+SPEED_MAX=10000          # Мбит/с
+SPEED_ERR=""
+
+# Корень awg0: ours — наша HTB; free — очередь по умолчанию (handle 0:);
+# busy — чужая, её не трогаем.
+_speed_root() {
+  local q
+  q=$(tc qdisc show dev "$AWG_IF" root 2>/dev/null | head -1)
+  case "$q" in
+    "qdisc htb $SPEED_H: "*) echo ours ;;
+    "" | "qdisc "*" 0: "*) echo free ;;
+    *) echo busy ;;
+  esac
+}
+
+# Запас HTB: ~20 мс на скорости, не меньше 16 КБ — иначе на малых скоростях
+# пакеты GSO (до 64 КБ) шли бы рывками.
+_speed_burst() { local b=$(( $1 * 5 / 2 )); (( b < 16 )) && b=16; echo "${b}k"; }
+
+# Команды tc -batch под план «адрес<TAB>Мбит/с»; $2 — ifb или police;
+# $3 — очередь внутри полос (fq_codel, а в ядре без него — проще).
+_speed_batch() {
+  local plan="$1" mode="$2" leaf="$3" ip r k=1 id b proto m prio d devs=("$AWG_IF")
+  [[ "$mode" == ifb ]] && devs+=("$SPEED_IFB")
+  echo "qdisc add dev $AWG_IF root handle $SPEED_H: htb default 1"
+  echo "class add dev $AWG_IF parent $SPEED_H: classid $SPEED_H:1 htb rate 10gbit quantum 60000"
+  echo "qdisc add dev $AWG_IF parent $SPEED_H:1 $leaf"
+  [[ "$mode" == down ]] || echo "qdisc add dev $AWG_IF handle ffff: ingress"
+  if [[ "$mode" == ifb ]]; then
+    echo "qdisc add dev $SPEED_IFB root handle $SPEED_H: htb default 1"
+    echo "class add dev $SPEED_IFB parent $SPEED_H: classid $SPEED_H:1 htb rate 10gbit quantum 60000"
+    echo "qdisc add dev $SPEED_IFB parent $SPEED_H:1 $leaf"
+  fi
+  while IFS=$'\t' read -r ip r; do
+    [[ -n "$ip" && "$r" =~ ^[0-9]+$ ]] || continue
+    k=$((k + 1)); id=$(printf '%x' "$k"); b=$(_speed_burst "$r")
+    # У одного приоритета фильтров — один протокол: IPv4 и IPv6 — разные
+    if [[ "$ip" == *:* ]]; then proto=ipv6 m=ip6 prio=2; else proto=ip m=ip prio=1; fi
+    for d in "${devs[@]}"; do
+      echo "class add dev $d parent $SPEED_H: classid $SPEED_H:$id htb rate ${r}mbit ceil ${r}mbit burst $b cburst $b quantum 1514"
+      echo "qdisc add dev $d parent $SPEED_H:$id $leaf"
+    done
+    echo "filter add dev $AWG_IF parent $SPEED_H: protocol $proto prio $prio u32 match $m dst $ip flowid $SPEED_H:$id"
+    if [[ "$mode" == ifb ]]; then
+      echo "filter add dev $SPEED_IFB parent $SPEED_H: protocol $proto prio $prio u32 match $m src $ip flowid $SPEED_H:$id"
+      echo "filter add dev $AWG_IF parent ffff: protocol $proto prio $prio u32 match $m src $ip action mirred egress redirect dev $SPEED_IFB"
+    elif [[ "$mode" == police ]]; then
+      echo "filter add dev $AWG_IF parent ffff: protocol $proto prio $prio u32 match $m src $ip police rate ${r}mbit burst $b drop flowid :1"
+    fi
+  done <<< "$plan"
+}
+
+# Снять наши правила: корень — только свой, вход и ifb — если ставили мы.
+speed_clear() {
+  local own="$EXPIRE_STATE_DIR/speed.own"
+  [[ "$(_speed_root)" == ours ]] && tc qdisc del dev "$AWG_IF" root 2>/dev/null
+  if [[ -f "$own" ]]; then
+    tc qdisc del dev "$AWG_IF" ingress 2>/dev/null
+    ip link show "$SPEED_IFB" &>/dev/null && ip link del "$SPEED_IFB" 2>/dev/null
+  fi
+  rm -f "$own" "$EXPIRE_STATE_DIR/speed" "$EXPIRE_STATE_DIR/speed.err" "$EXPIRE_STATE_DIR/speed.mode"
+  return 0
+}
+
+# Снять поставленное наполовину (прошлая попытка сборки не прошла).
+_speed_undo() {
+  [[ "$(_speed_root)" == ours ]] && tc qdisc del dev "$AWG_IF" root 2>/dev/null
+  tc qdisc del dev "$AWG_IF" ingress 2>/dev/null
+  ip link show "$SPEED_IFB" &>/dev/null && tc qdisc del dev "$SPEED_IFB" root 2>/dev/null
+  return 0
+}
+
+# Поставить правила по плану заново. Ошибка — в SPEED_ERR; в speed.mode —
+# как режется отдача: ifb, police или down (никак: в ядре нет ни ifb, ни
+# полисера — режется только скачивание).
+_speed_build() {
+  local plan="$1" own="$EXPIRE_STATE_DIR/speed.own" bat errf rc=1 leaf mode modes=(police down)
+  mkdir -p "$EXPIRE_STATE_DIR"
+  # Вход awg0 занят не нами (своя очередь ingress, поставленная руками) — не трогаем
+  if [[ ! -f "$own" ]] && tc qdisc show dev "$AWG_IF" ingress 2>/dev/null | grep -q .; then
+    SPEED_ERR="на $AWG_IF уже стоит своя очередь ingress (tc) — не трогаю"
+    return 1
+  fi
+  : > "$own"
+  _speed_undo
+  # numifbs=0: модуль без лишних ifb0 и ifb1
+  [[ -d /sys/module/ifb ]] || modprobe ifb numifbs=0 2>/dev/null || true
+  if { ip link show "$SPEED_IFB" &>/dev/null || ip link add "$SPEED_IFB" type ifb 2>/dev/null; } \
+     && ip link set "$SPEED_IFB" up 2>/dev/null; then
+    modes=(ifb police down)
+  fi
+  bat=$(mktemp) && errf=$(mktemp) || return 1
+  # Очередь в полосах: fq_codel есть в ядрах Ubuntu и Debian; нет — sfq,
+  # затем простая. Не принят режим отдачи (нет act_mirred, act_police) — следующий.
+  for mode in "${modes[@]}"; do
+    for leaf in fq_codel "sfq perturb 10" "pfifo limit 1000"; do
+      _speed_batch "$plan" "$mode" "$leaf" > "$bat"
+      if tc -batch "$bat" 2>"$errf"; then rc=0; break 2; fi
+      _speed_undo
+      grep -q 'qdisc kind is unknown' "$errf" || break
+    done
+  done
+  if (( rc )); then
+    SPEED_ERR="tc: $(grep -v '^Command failed' "$errf" | head -2 | tr '\n' ' ')"
+    SPEED_ERR="${SPEED_ERR% }"
+  else
+    printf '%s\n' "$mode" > "$EXPIRE_STATE_DIR/speed.mode"
+    [[ "$mode" == ifb ]] || { ip link show "$SPEED_IFB" &>/dev/null && ip link del "$SPEED_IFB" 2>/dev/null; }
+  fi
+  rm -f "$bat" "$errf"
+  return "$rc"
+}
+
+# Привести tc к плану. 0 — стоит как надо, или ограничений нет, или awg0 не поднят (таймер
+# поставит, когда поднимется); 1 — не вышло (причина в SPEED_ERR).
+speed_apply() {
+  local plan st="$EXPIRE_STATE_DIR/speed" root
+  SPEED_ERR=""
+  [[ -f "$SERVER_CONF" ]] || return 0
+  plan=$(py speed-plan "$SERVER_CONF" "$EXPIRE_SUSPEND_IP") || { SPEED_ERR="план скорости не прочитан"; return 1; }
+  if [[ -z "$plan" ]]; then
+    [[ -f "$st" || -f "$st.own" ]] && speed_clear
+    return 0
+  fi
+  ip link show "$AWG_IF" &>/dev/null || return 0
+  root=$(_speed_root)
+  if [[ "$root" == busy ]]; then
+    SPEED_ERR="на $AWG_IF уже стоит своя очередь tc — не трогаю"
+    return 1
+  fi
+  [[ "$root" == ours && "$(cat "$st" 2>/dev/null)" == "$plan" ]] && return 0
+  _speed_build "$plan" || return 1
+  printf '%s\n' "$plan" > "$st"
+}
+
+# Проход таймера: ограничений нет и не было — один grep. Ошибка пишется в
+# журнал сроков один раз, пока не сменится.
+speed_check() {
+  local st="$EXPIRE_STATE_DIR/speed" e
+  [[ -f "$st" || -f "$st.own" ]] || grep -qE '^#[[:space:]]*(speed|slowed_by)=' "$SERVER_CONF" 2>/dev/null || return 0
+  if speed_apply; then rm -f "$st.err"; return 0; fi
+  e="${SPEED_ERR:-tc не принял правила}"
+  if [[ "$(cat "$st.err" 2>/dev/null)" != "$e" ]]; then
+    mkdir -p "$EXPIRE_STATE_DIR"
+    printf '%s\n' "$e" > "$st.err"
+    echo "$(date '+%F %T') speed: $e" >> "$EXPIRE_LOG"
+  fi
+  return 0
+}
+
+# Число Мбит/с из ввода («20», «20M», «20 Мбит»); off, 0, пусто — без ограничения.
+_speed_num() {  # → число или пусто; 1 — не распознано
+  local v="${1// /}"
+  v="${v,,}"; v="${v%/s}"; v="${v%/с}"; v="${v%mbit}"; v="${v%мбит}"; v="${v%Мбит}"; v="${v%m}"; v="${v%м}"; v="${v%М}"
+  case "$v" in off | 0 | "" | none | no) echo ""; return 0 ;; esac
+  [[ "$v" =~ ^[0-9]{1,5}$ ]] || return 1
+  v=$((10#$v))
+  (( v >= 1 && v <= SPEED_MAX )) || return 1
+  echo "$v"
+}
+
+client_speed_set() {  # имя Мбит/с|off
+  local name="$1" v
+  client_exists "$name" || { err "Клиента $name нет"; return 1; }
+  v=$(_speed_num "$2") || { err "Скорость: целое число Мбит/с от 1 до $SPEED_MAX или off"; return 1; }
+  py meta-set "$SERVER_CONF" "$name" speed "$v" || return 1
+  expire_install
+  if ! speed_apply; then
+    err "Скорость записана, но не применилась: $SPEED_ERR"
+    return 1
+  fi
+  if [[ -n "$v" ]]; then ok "Скорость $name: $v Мбит/с"; else ok "$name — без ограничения скорости"; fi
+  [[ -n "$v" && "$(cat "$EXPIRE_STATE_DIR/speed.mode" 2>/dev/null)" == down ]] \
+    && warn "Отдача (клиент → сервер) не ограничивается: в ядре нет ни ifb, ни полисера tc — режется только скачивание"
+  return 0
+}
+
+# Что делать, когда лимит трафика исчерпан: block — блокировать (как было),
+# число — замедлять до стольких Мбит/с. Применяется сразу.
+client_limit_mode() {  # имя block|Мбит/с
+  local name="$1" v
+  client_exists "$name" || { err "Клиента $name нет"; return 1; }
+  if [[ "$2" == block ]]; then v=""
+  else
+    v=$(_speed_num "$2") && [[ -n "$v" ]] || { err "При исчерпании: block или скорость в Мбит/с от 1 до $SPEED_MAX"; return 1; }
+  fi
+  py meta-set "$SERVER_CONF" "$name" limit_slow "$v" || return 1
+  expire_install
+  traffic_tick 1
+  [[ -f "$EXPIRE_STATE_DIR/speed.err" ]] && warn "Скорость не применилась: $(cat "$EXPIRE_STATE_DIR/speed.err")"
+  if [[ -n "$v" ]]; then ok "$name: исчерпал лимит — замедлять до $v Мбит/с"
+  else ok "$name: исчерпал лимит — блокировать"; fi
+}
+
+# «20 Мбит/с», «🐢 1 Мбит/с — лимит исчерпан» для меню.
+speed_fmt() {  # speed limit_slow slowed_by
+  local sp="$1" slow="$2" by="$3"
+  if [[ "$by" == traffic && -n "$slow" ]]; then
+    if [[ -n "$sp" ]] && (( sp < slow )); then echo "$sp Мбит/с"; else echo "🐢 $slow Мбит/с — лимит исчерпан"; fi
+  elif [[ -n "$sp" ]]; then echo "$sp Мбит/с"
+  fi
+}
+
+_ask_speed() {  # → Мбит/с, «off» или пусто (отмена)
+  local v
+  echo -e "  ${D}Одна цифра на скачивание и отдачу, Мбит/с: 5, 10, 20, 50, 100; 0 — без ограничения${N}" >&2
+  read -rp "  Скорость: " v
+  [[ -n "$v" ]] || return 0
+  v=$(_speed_num "$v") || { warn "Не понял скорость: целое число Мбит/с от 1 до $SPEED_MAX" >&2; return 0; }
+  echo "${v:-off}"
+}
+
+_ask_limit_mode() {  # → block, Мбит/с или пусто (отмена)
+  local c
+  echo -e "  ${C}1)${N} Блокировать ${D}— как истёкший; в новом месяце разблокируется сам${N}" >&2
+  echo -e "  ${C}2)${N} Замедлять до 1 Мбит/с" >&2
+  echo -e "  ${C}3)${N} Замедлять до 2 Мбит/с" >&2
+  echo -e "  ${C}4)${N} Замедлять до 5 Мбит/с" >&2
+  read_choice c "${C}  Исчерпал лимит [1-4]: ${N}" 1 4 1
+  case "$c" in 2) echo 1 ;; 3) echo 2 ;; 4) echo 5 ;; *) echo block ;; esac
 }
 
 # ═════ tunnels ═════
@@ -6594,6 +6882,25 @@ exits_nodes() {
   done | LC_ALL=C sort
 }
 
+# Ноды для карточек панели: имя, поднята, адрес, рукопожатие, принято, отдано,
+# протокол (awg — есть параметры обфускации, иначе wg)
+exits_node_rows() {
+  local n f ep up hs rx tx proto dump
+  while IFS= read -r n; do
+    f="$EXITS_DIR/awg-exit-$n.conf"
+    ep=$(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$f" 2>/dev/null | head -1 | tr -d '\t\r')
+    if grep -qE '^[[:space:]]*(Jc|S1|H1)[[:space:]]*=' "$f" 2>/dev/null; then proto=awg; else proto=wg; fi
+    up=0 hs=0 rx=0 tx=0
+    if ip link show "awg-exit-$n" &>/dev/null; then
+      up=1
+      dump=$(awg show "awg-exit-$n" dump 2>/dev/null | sed -n 2p)
+      [[ -z "$dump" ]] || IFS=$'\t' read -r _ _ _ _ hs rx tx _ <<< "$dump"
+    fi
+    [[ "$hs" =~ ^[0-9]+$ ]] || hs=0; [[ "$rx" =~ ^[0-9]+$ ]] || rx=0; [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$up" "$ep" "$hs" "$rx" "$tx" "$proto"
+  done < <(exits_nodes)
+}
+
 exits_up_nodes() {
   local n
   while IFS= read -r n; do
@@ -6839,13 +7146,13 @@ _exits_node_line() {  # нода → строка статуса
   fi
 }
 
-exits_list() {
+exits_list() {  # [fast] — без проверки выхода в интернет через ноды
   local nodes=() n ip sample
   mapfile -t nodes < <(exits_nodes)
   (( ${#nodes[@]} )) || { info "Нод нет"; return 0; }
   for n in "${nodes[@]}"; do
     echo -e "  ${W}$n${N}  $(_exits_node_line "$n")"
-    if ip link show "awg-exit-$n" &>/dev/null; then
+    if [[ "${1:-}" != fast ]] && ip link show "awg-exit-$n" &>/dev/null; then
       ip=$(iface_egress_ip "awg-exit-$n" 5)
       if [[ -n "$ip" ]]; then echo -e "      выход в интернет: ${G}$ip${N}"; else echo -e "      ${R}выхода в интернет нет${N}"; fi
     fi
@@ -10958,7 +11265,7 @@ do_diag_menu() {
 # Главное меню и шапка. Нумерация разделов — как в прежних версиях.
 
 show_header() {
-  local ch="" upd n prof st hint why
+  local ch="" upd n prof st why
   clear
   [[ "$UPDATE_CHANNEL" == beta ]] && ch=" ${Y}[beta]${N}"
   upd=$(update_available || true)
@@ -10973,9 +11280,8 @@ show_header() {
     prof="AWG $(server_proto), $(profile_label "$(server_profile)")"
     if iface_up; then st="${G}● работает${N}"; else st="${R}○ не поднят${N}"; fi
     echo -e "  Сервер     : ${W}$(endpoint_host):$(server_port)${N}  $st"
+    # Перехода на 3.1 здесь не предлагаем: 2.0 — такой же обычный выбор (Сервер → Протокол)
     echo -e "  Профиль    : ${W}$prof${N}, клиентов ${W}$n${N}"
-    hint=$(proto_upgrade_hint)
-    [[ -n "$hint" ]] && echo -e "  $hint"
   else
     echo -e "  Сервер     : ${D}не создан — Сервер → Создать сервер${N}"
   fi
@@ -11107,6 +11413,8 @@ API_ARGS=()
 # j готовый JSON, f содержимое файла; без типа — строка.
 _kv() { printf '%s\t%s\n' "$1" "${2//[$'\n\r']/ }"; }
 _b() { if "$@" &>/dev/null; then echo 1; else echo 0; fi; }
+# Счётчик из файла или вывода команды: не число (нет интерфейса) — 0
+_n() { local v; v=$("$@" 2>/dev/null | head -1); [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
 api_obj() { py json-kv > "$API_DATA"; }
 api_rows() { py json-rows "$@" > "$API_DATA"; }
 api_list() { py json-list > "$API_DATA"; }
@@ -11153,6 +11461,9 @@ _api_ts() {
 _api_status() {
   local n=0
   os_detect
+  # Адрес сервера — здесь, в этой оболочке: внутри $(…) ниже кэш public_ip_cached
+  # не сохраняется, и без этого адрес узнавался дважды (ip и endpoint)
+  public_ip_cached >/dev/null
   update_check_async || true
   upstream_refresh_async || true
   country_refresh_async || true
@@ -11223,7 +11534,6 @@ _api_server() {
           _kv clients:n "$(client_files | grep -c . || true)"
         fi
       } | api_obj
-      server_exists && proto_upgrade_hint
       return 0 ;;
     install) do_install ;;
     create)
@@ -11244,11 +11554,16 @@ _api_server() {
             _kv errors:j "$(py json-list <<< "$PARAMS_ERR")"; _kv warnings:j "$(py json-list <<< "$PARAMS_WARN")"
             _kv changed:j "$(py json-list <<< "$PARAMS_CHANGED")"; _kv breaking:j "$(py json-list <<< "$PARAMS_BREAKING")"
           } | api_obj ;;
+        gen)
+          [[ "${1:-pro}" =~ ^(lite|pro)$ ]] || { _api_usage "server params gen [lite|pro]"; return; }
+          params_gen "${1:-pro}" || return 1
+          { _kv proto "$(server_proto)"
+            while IFS=$'\t' read -r k v; do [[ -n "$k" ]] && _kv "values.$k" "$v"; done <<< "$PARAMS_GEN"; } | api_obj ;;
         set)
           server_params_set "$@" || return 1
           { _kv changed:j "$(py json-list <<< "$PARAMS_CHANGED")"; _kv breaking:j "$(py json-list <<< "$PARAMS_BREAKING")"
             _kv clients:n "$PARAMS_CLIENTS"; } | api_obj ;;
-        *) _api_usage "server params [check|set [force]] [Ключ=значение...]" ;;
+        *) _api_usage "server params [check|gen [lite|pro]|set [force]] [Ключ=значение...]" ;;
       esac ;;
     proto)
       [[ "${1:-}" =~ ^(2\.0|3\.1)$ ]] || { _api_usage "server proto 2.0|3.1"; return; }
@@ -11415,7 +11730,7 @@ _api_clients_bulk() {
 
 _api_client() {
   local a="${1:-}" name="${2:-}" f
-  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset ИМЯ ..."; return; }
+  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed ИМЯ ..."; return; }
   shift 2
   case "$a" in
     add)
@@ -11444,7 +11759,13 @@ _api_client() {
       [[ -n "${1:-}" ]] || { _api_usage "client limit ИМЯ 50G|500M|off [month|total]"; return; }
       client_limit_set "$name" "$1" "${2:-month}" ;;
     limit-reset) client_limit_reset "$name" ;;
-    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset ИМЯ ..." ;;
+    limit-mode)
+      [[ -n "${1:-}" ]] || { _api_usage "client limit-mode ИМЯ block|Мбит/с"; return; }
+      client_limit_mode "$name" "$1" ;;
+    speed)
+      [[ -n "${1:-}" ]] || { _api_usage "client speed ИМЯ Мбит/с|off"; return; }
+      client_speed_set "$name" "$1" ;;
+    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed ИМЯ ..." ;;
   esac
 }
 
@@ -11536,7 +11857,13 @@ _api_tunnels() {
         _kv exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
         _kv cascade:n "$(cascade_count)"
         if dns_installed; then _kv dns "$(dns_running && echo up || echo off)"; else _kv dns none; fi
-        _kv active "$(tunnel_conflict none)"; } | api_obj ;;
+        _kv active "$(tunnel_conflict none)"
+        # Счётчики интерфейсов туннелей (для карточек и сводки панели): есть — поднят
+        _kv ifs:j "$(for i in "$WARP_IF" "$XRAY_IF" "$T2S_IF"; do
+                      [[ -r "/sys/class/net/$i/statistics/rx_bytes" ]] || continue
+                      printf '%s\t%s\t%s\n' "$i" "$(_n cat "/sys/class/net/$i/statistics/rx_bytes")" \
+                        "$(_n cat "/sys/class/net/$i/statistics/tx_bytes")"
+                    done | py json-rows iface rx:n tx:n)"; } | api_obj ;;
     panic) tunnels_panic_reset quiet; ok "Туннели выключены — клиенты идут напрямую" ;;
     clients)
       case "${2:-}" in
@@ -11565,7 +11892,13 @@ _api_warp() {
         _kv configured:b "$(_b warp_configured)"
         _kv failed:b "$(_b test -f "$WARP_STATE.failed")"
         _kv health:b "$(_b unit_active awg-warp-healthcheck.timer)"
-        _kv wg_possible:b "$(_b warp_wg_possible)"; _kv usque_possible:b "$(_b warp_usque_possible)"; } | api_obj
+        _kv wg_possible:b "$(_b warp_wg_possible)"; _kv usque_possible:b "$(_b warp_usque_possible)"
+        # Для карточки: интерфейс, адрес Cloudflare, рукопожатие (wg) и счётчики
+        _kv iface "$WARP_IF"
+        _kv endpoint "$([[ "$be" == wg ]] && sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_CONF" 2>/dev/null | head -1)"
+        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <(wg show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
+        _kv rx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/rx_bytes")"
+        _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"; } | api_obj
       warp_status ;;
     install) if [[ "$be" == wg ]]; then warp_wg_install; else warp_usque_install; fi ;;
     up) warp_up ;;
@@ -11607,6 +11940,8 @@ _api_xray() {
         _kv main "$(xray_installed && py xray-main-get "$XRAY_CONF" 2>/dev/null)"
         _kv per_client:b "$(xray_installed && _b xray_tun_supported || echo 0)"
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
+        # Выходы для карточек: протокол, защита, транспорт, адрес
+        _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" 2>/dev/null; } | py json-rows tag proto sec net host port:n)"
         _kv ru:b "$(_b xray_ru_on)"; } | api_obj
       xray_status ;;
     install) xray_install update ;;
@@ -11658,10 +11993,11 @@ _api_exits() {
     status)
       { _kv up:b "$(_b exits_is_up)"; _kv mode "$(exits_state_get mode)"
         _kv balancer "$(exits_state_get balancer)"; _kv single "$(exits_state_get single_exit)"
-        _kv nodes:j "$(while IFS= read -r n; do
-                          printf '%s\t%s\n' "$n" "$(_b ip link show "awg-exit-$n")"
-                        done < <(exits_nodes) | py json-rows name up:b)"; } | api_obj
-      exits_status; exits_list ;;
+        _kv nodes:j "$(exits_node_rows | py json-rows name up:b endpoint hs:n rx:n tx:n proto)"; } | api_obj
+      # Проверка выхода в интернет через каждую ноду (до 5 с на ноду) — только по
+      # «exits status check», для экрана exit-нод: список клиентов, обзор и туннели
+      # зовут status на каждом открытии и ждать её не должны
+      exits_status; exits_list "$([[ "${1:-}" == check ]] || echo fast)" ;;
     add)
       [[ -n "${1:-}" ]] || { _api_usage "exits add ИМЯ < конфиг"; return; }
       _api_stdin
@@ -11681,7 +12017,7 @@ _api_exits() {
       # all / none без второго аргумента — все клиенты; с ним — клиент с таким именем
       [[ "${1:-}" == all || "${1:-}" == none || -n "${2:-}" ]] || { _api_usage "exits client ИМЯ off|shared|НОДА | all | none"; return; }
       exits_client "$1" "${2:-}" ;;
-    *) _api_usage "exits status|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА|all|none" ;;
+    *) _api_usage "exits status [check]|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА|all|none" ;;
   esac
 }
 
@@ -14113,7 +14449,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
-_PY_HELPER_SUM=8a849d804dcec477
+_PY_HELPER_SUM=f27d5c0db43f32a9
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -14255,7 +14591,8 @@ def cmd_peers(conf):
             continue
         print("\t".join([peer_name(b), pub, peer_field(b, "AllowedIPs"),
                          peer_meta(b, "expires"), peer_meta(b, "orig_ips"),
-                         peer_meta(b, "mimicry"), peer_meta(b, "limit"), peer_meta(b, "blocked_by")]))
+                         peer_meta(b, "mimicry"), peer_meta(b, "limit"), peer_meta(b, "blocked_by"),
+                         peer_meta(b, "speed"), peer_meta(b, "limit_slow"), peer_meta(b, "slowed_by")]))
 
 
 def cmd_meta_set(conf, name, key, value):
@@ -14790,10 +15127,20 @@ def _unblock(b, suspend):
 PERIOD_WORD = {"month": "за месяц", "total": "всего"}
 
 
+def _mbit(value):
+    """Метка скорости (Мбит/с) → число; не число или 0 — 0 (без ограничения)."""
+    return int(value) if (value or "").isdigit() and 0 < int(value) <= SPEED_MAX else 0
+
+
+SPEED_MAX = 10000
+
+
 def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
     """Проход таймера: прирост трафика в базу и проверка лимитов. События:
     CHANGED; LIMIT<TAB>имя<TAB>адрес<TAB>текст; WARN90<TAB>имя<TAB>текст;
-    UNLIMIT<TAB>имя<TAB>текст."""
+    UNLIMIT<TAB>имя<TAB>текст; SLOW<TAB>имя<TAB>Мбит/с<TAB>текст;
+    UNSLOW<TAB>имя<TAB>текст. Мягкий лимит («# limit_slow=N»): исчерпавший
+    не блокируется, а замедляется до N Мбит/с («# slowed_by=traffic»)."""
     lock = _traffic_lock(db)
     try:
         text = read(conf)
@@ -14811,25 +15158,41 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
         alive.add(pub)
         name = peer_name(b) or pub[:8]
         limit, period = parse_limit(peer_meta(b, "limit"))
+        slow = _mbit(peer_meta(b, "limit_slow"))
         by_traffic = peer_meta(b, "blocked_by") == "traffic"
+        slowed = peer_meta(b, "slowed_by") == "traffic"
         exp = peer_meta(b, "expires")
         expired = exp.isdigit() and now >= int(exp)
         used = t.used(pub, period) if limit else 0
         word = "%s из %s %s" % (fmt_bytes(used), fmt_bytes(limit), PERIOD_WORD.get(period, "")) if limit else ""
-        if by_traffic and (not limit or used < limit):
+        over = bool(limit) and used >= limit
+        # Блокировку за трафик снимает и смена режима на «замедлять»
+        if by_traffic and (not over or slow):
             if expired:
                 # Лимит отпустил, но истёк срок: блокировку держит уже он,
                 # и снимается она сроком
                 peers[i] = set_meta(b, "blocked_by", "")
             else:
                 peers[i] = _unblock(b, suspend)
-                events.append("UNLIMIT\t%s\t%s" % (name, word or "лимит снят"))
+                if not over:
+                    events.append("UNLIMIT\t%s\t%s" % (name, word or "лимит снят"))
             changed = True
-        elif limit and used >= limit and aip != suspend:
+            b, aip = peers[i], peer_field(peers[i], "AllowedIPs")
+        if slowed and not (over and slow):
+            peers[i] = b = set_meta(b, "slowed_by", "")
+            changed = True
+            if not over:
+                events.append("UNSLOW\t%s\t%s" % (name, word or "лимит снят"))
+        if over and slow:
+            if not slowed:
+                peers[i] = set_meta(b, "slowed_by", "traffic")
+                changed = True
+                events.append("SLOW\t%s\t%d\t%s" % (name, slow, word))
+        elif over and aip != suspend:
             peers[i] = _block(b, suspend, aip, "traffic")
             changed = True
             events.append("LIMIT\t%s\t%s\t%s" % (name, aip, word))
-        elif limit and used >= limit * 0.9 and aip != suspend:
+        elif limit and not over and used >= limit * 0.9 and aip != suspend:
             mark = "%s:%d" % (t.period_key(period), limit)
             if t.d["warned"].get(pub) != mark:
                 t.d["warned"][pub] = mark
@@ -14843,6 +15206,32 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
     del lock
     for e in events:
         print(e)
+
+
+def cmd_speed_plan(conf, suspend):
+    """План скорости для tc: «адрес<TAB>Мбит/с» на каждый адрес клиента с
+    ограничением — своей скоростью («# speed=N») или мягким лимитом трафика
+    (замедлен — «# slowed_by=traffic», до «# limit_slow=N»); действует
+    меньшее. Заблокированные (адрес-заглушка) — без строк."""
+    import ipaddress
+    try:
+        _, peers = split_peers(read(conf))
+    except OSError:
+        return
+    for b in peers:
+        aip = peer_field(b, "AllowedIPs")
+        if not aip or aip == suspend:
+            continue
+        rates = [r for r in (_mbit(peer_meta(b, "speed")),
+                             _mbit(peer_meta(b, "limit_slow")) if peer_meta(b, "slowed_by") == "traffic" else 0) if r]
+        if not rates:
+            continue
+        for a in aip.split(","):
+            try:
+                net = ipaddress.ip_network(a.strip(), strict=False)
+            except ValueError:
+                continue
+            print("%s\t%d" % (net, min(rates)))
 
 
 def _traffic_lock(db):
@@ -14933,7 +15322,8 @@ def cmd_traffic_daily(conf, db, transfer, name="", days="30"):
         for p, n in names.items():
             _, r, s = t.series([p], days)
             if sum(r) + sum(s):
-                rows.append({"name": n or p[:8], "rx": sum(r), "tx": sum(s)})
+                # d — по дням (приём + отдача): мини-график в карточке клиента
+                rows.append({"name": n or p[:8], "rx": sum(r), "tx": sum(s), "d": [a + b for a, b in zip(r, s)]})
         out["clients"] = sorted(rows, key=lambda c: -(c["rx"] + c["tx"]))
     print(json.dumps(out, ensure_ascii=False))
 
@@ -15531,6 +15921,20 @@ def cmd_xray_tags(path):
         print(t)
 
 
+def cmd_xray_outs(path):
+    """Выходы для карточек панели: тег, протокол, защита, транспорт, адрес, порт (TSV)."""
+    clean = lambda v: str(v).replace("\t", " ").replace("\n", " ")  # noqa: E731
+    for o in jload(path).get("outbounds", []):
+        if not o.get("tag") or o.get("protocol") in SKIP_PROTO:
+            continue
+        st, sets = o.get("streamSettings") or {}, o.get("settings") or {}
+        srv = (sets.get("vnext") or sets.get("servers") or [sets])[0] or {}
+        port = srv.get("port") or 0
+        print("\t".join(clean(v) for v in (o["tag"], o.get("protocol", ""), st.get("security") or "none",
+                                          st.get("network") or "tcp", srv.get("address", ""),
+                                          port if isinstance(port, int) else 0)))
+
+
 def probe_conf(outbound):
     return {"log": {"loglevel": "none"},
             "inbounds": [{"listen": "127.0.0.1", "port": 10808, "protocol": "socks",
@@ -15984,6 +16388,9 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
         by = peer_meta(b, "blocked_by")
         row.update(limit=limit or None, period=period or None,
                    blocked_by=(by or "expire") if orig else None,
+                   speed=_mbit(peer_meta(b, "speed")) or None,
+                   limit_slow=_mbit(peer_meta(b, "limit_slow")) or None,
+                   slowed=peer_meta(b, "slowed_by") == "traffic",
                    used=traffic.used(pub, period) if traffic and limit else None,
                    month=traffic.raw_used(pub, "month") if traffic else None,
                    today=sum((traffic.d["days"].get(today) or {}).get(pub) or [0, 0]) if traffic else None)
@@ -16378,13 +16785,14 @@ COMMANDS = {
     "traffic-tick": cmd_traffic_tick, "traffic-daily": cmd_traffic_daily, "traffic-now": cmd_traffic_now,
     "traffic-rows": cmd_traffic_rows, "traffic-report": cmd_traffic_report,
     "limit-set": cmd_limit_set, "limit-reset": cmd_limit_reset, "size-parse": cmd_size_parse,
+    "speed-plan": cmd_speed_plan,
     "web-hash": cmd_web_hash,
     "net-of": cmd_net_of, "pick-net": cmd_pick_net, "net-overlaps": cmd_net_overlaps,
     "allowed-except": cmd_allowed_except,
     "rand-key": cmd_rand_key, "phobos-link": cmd_phobos_link, "exit-conf-fix": cmd_exit_conf_fix,
     "conf-hooks": cmd_conf_hooks, "mod-compat-patch": cmd_mod_compat_patch,
     "xray-link": cmd_xray_link, "xray-default": cmd_xray_default, "xray-add": cmd_xray_add,
-    "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
+    "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-outs": cmd_xray_outs, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
     "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
@@ -16415,5 +16823,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=4a3cb70ae9642cb4
+_BUILD_SUM=b891490317dccdb1
 main "$@"

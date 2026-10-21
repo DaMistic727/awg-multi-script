@@ -16,6 +16,11 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       showConfirm: (t, cb) => { window.__log.push("confirm:" + t); cb(true); },
       showAlert: (t) => { window.__log.push("alert:" + t); },
     } };
+    // Сценарий ниже — про «Классику» (нижняя панель разделов); «Карточки» — в конце
+    try {
+      const v = JSON.parse(localStorage.getItem("awg-look") || "null") || {};
+      if (!v.skin) { v.skin = "toolza"; localStorage.setItem("awg-look", JSON.stringify(v)); }
+    } catch (_) { /* без localStorage — как есть */ }
   }, { initData, theme });
   const page = await ctx.newPage();
   page.setDefaultTimeout(15000);
@@ -194,12 +199,13 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
 
   await step("не запустилась — причина на экране, а не вечная «Загрузка…»", async () => {
     const p2 = await ctx.newPage();
-    await p2.route(/\/app\.js$/, (r) => r.abort());
+    await p2.route(/\/app\.js(\?|$)/, (r) => r.abort());
     await p2.goto(base, { waitUntil: "domcontentloaded" });
     await p2.waitForSelector(".boot-fail >> text=не загрузился app.js", { timeout: 5000 });
+    if (/\?v=/.test(await p2.textContent(".boot-fail"))) throw new Error("в причине — отпечаток версии из адреса скрипта");
     if (!await p2.locator(".boot-fail button:has-text('Повторить')").count()) throw new Error("нет кнопки «Повторить»");
-    await p2.unroute(/\/app\.js$/);
-    await p2.route(/\/app\.js$/, async (r) => { const res = await r.fetch(); r.fulfill({ response: res, body: "window.x = ;" }); });
+    await p2.unroute(/\/app\.js(\?|$)/);
+    await p2.route(/\/app\.js(\?|$)/, async (r) => { const res = await r.fetch(); r.fulfill({ response: res, body: "window.x = ;" }); });
     await p2.reload({ waitUntil: "domcontentloaded" });
     await p2.waitForSelector(".boot-fail >> text=/SyntaxError|Unexpected/", { timeout: 5000 });
     await p2.close();
@@ -357,7 +363,67 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click(".sheet >> text=Снять лимит");
     await page.waitForSelector(".kv >> text=нет");
   });
+  await step("лимит трафика: исчерпал — замедлять (сразу, без «Сохранить»), в карточке видно", async () => {
+    await nav("/client/alice/limit", "#app:not(.reloading) input");
+    await page.waitForSelector("[data-name=limit-mode] button.on[data-v=block]");
+    await page.click("[data-name=limit-mode] button[data-v='2']");
+    await page.waitForSelector(".toast >> text=замедлять до 2 Мбит/с");
+    await page.waitForSelector("[data-name=limit-mode] button.on[data-v='2']");
+    await page.fill("#app input", "10G");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".kv >> text=/из 10.0 ГБ за месяц · исчерпал — 🐢 до 2 Мбит\\/с/");
+    await shot("03c-limit-slow");
+    await nav("/client/alice/limit", "#app:not(.reloading) input");
+    await page.click("[data-name=limit-mode] button[data-v=block]");
+    await page.waitForSelector("[data-name=limit-mode] button.on[data-v=block]");
+    await nav("/client/alice", ".actions");
+    await page.click(".actions button:has-text('Лимит')"); await page.waitForSelector(".sheet");
+    await page.click(".sheet >> text=Снять лимит");
+    await page.waitForSelector(".kv >> text=нет");
+  });
+  await step("скорость: готовая из листа — в карточке строкой и меткой", async () => {
+    await page.waitForSelector(".kv >> text=без ограничения");
+    await page.click(".actions button:has-text('Скорость')"); await page.waitForSelector(".sheet");
+    await page.click(".sheet >> text=20 Мбит/с");
+    await page.waitForSelector(".kv >> text=20 Мбит/с");
+    await page.waitForSelector(".tag >> text=20 Мбит/с");
+    await shot("03d-speed");
+  });
+  await step("скорость: своя — проверка ввода, 35, «Без ограничения»", async () => {
+    await nav("/client/alice/speed", "#app:not(.reloading) input");
+    if (await page.inputValue("#app input") !== "20") throw new Error("поле без текущей скорости");
+    await expectAlert("целое число", async () => { await page.fill("#app input", "0.5"); await page.click("button:has-text('Сохранить')"); });
+    await page.fill("#app input", "35");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".kv >> text=35 Мбит/с");
+    await nav("/client/alice/speed", "#app:not(.reloading) input");
+    await page.click("button:has-text('Без ограничения')");
+    await page.waitForSelector(".kv >> text=без ограничения");
+  });
   await step("QR", async () => { await page.click("text=Конфиг и QR"); await page.waitForSelector("img.qr"); await shot("04-qr"); });
+  await step("ссылка на 5 минут: создаётся, открывается без входа (QR, текст, файл), отзывается", async () => {
+    await page.click("[data-name=share] button:has-text('Ссылка на 5 минут')");
+    await page.waitForSelector("[data-name=share] input");
+    const link = await page.inputValue("[data-name=share] input");
+    if (!new RegExp("^https://127\\.0\\.0\\.1:" + port + "/s/[A-Za-z0-9_-]{32}$").test(link)) throw new Error("ссылка: " + link);
+    await page.waitForSelector("[data-name=share] >> text=/действует ещё [45]:\\d\\d/");
+    await shot("04b-share");
+    // Получатель: без Telegram и без входа
+    const p2 = await ctx.newPage();
+    await p2.goto(link);
+    if (await p2.locator("text=PrivateKey").count()) throw new Error("конфиг на странице до нажатия");
+    await p2.click("#show");
+    await p2.waitForSelector("#box:not([hidden])");
+    if (!await p2.locator("#qr[src^='data:image/png']").count() && !await p2.locator("#noqr:not([hidden])").count()) throw new Error("ни QR, ни пояснения");
+    if (!/PrivateKey/.test(await p2.textContent("#text"))) throw new Error("нет текста конфига");
+    if (await p2.textContent("#fname") !== "alice.conf") throw new Error("имя файла: " + await p2.textContent("#fname"));
+    await p2.screenshot({ path: `${out}/04c-share-page.png`, fullPage: true });
+    await page.click("[data-name=share] button:has-text('Отозвать')");
+    await page.waitForSelector(".toast >> text=Ссылка отозвана");
+    await p2.reload();
+    await p2.waitForSelector("text=Ссылка недействительна");
+    await p2.close();
+  });
   await step("в чат (одна кнопка, без ZIP — он только в веб-панели)", async () => {
     if (await page.$(".confbtns") || await page.$("button:has-text('ZIP')")) throw new Error("в Mini App кнопка ZIP");
     await page.click("text=Отправить файл в чат"); await page.waitForSelector(".toast >> text=Файл и QR");
@@ -386,6 +452,15 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/add", "input");
     // Кнопка со случайным именем — одна иконка: подпись для чтения с экрана и всплывающая нужны
     if (await page.locator("button[aria-label='Случайное имя'][title='Случайное имя']").count() !== 1) throw new Error("кнопка «🎲» без подписи");
+    // Случайное имя — 6 букв и цифра, каждый раз новое
+    const seen = new Set();
+    for (let i = 0; i < 5; i++) {
+      await page.click("button[aria-label='Случайное имя']");
+      const v = await page.inputValue("input");
+      if (!/^[a-z]{6}[0-9]$/.test(v)) throw new Error("случайное имя не по форме: " + v);
+      seen.add(v);
+    }
+    if (seen.size < 4) throw new Error("случайные имена повторяются: " + [...seen]);
     await page.fill("input", "carol");
     await page.selectOption("select", "+1d");
     await shot("06-add");
@@ -570,13 +645,16 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
 
   // ── Туннели и DNS ──
   await step("туннели", async () => {
-    await nav("/tunnels", ".ecard");
-    const n = await page.locator(".ecard").count();
+    // Экран туннелей — карточками и в «Классике»
+    await nav("/tunnels", ".kcard");
+    await page.click(".ktabs button[data-tab=tun]");
+    const n = await page.locator(".kcard").count();
     if (n !== 6) throw new Error("ждали 6 карточек (4 туннеля, каскад, DNS), есть " + n);
-    await page.waitForSelector(".sgrid >> text=Exit-ноды");
+    await page.waitForSelector(".kstats >> text=Exit-ноды");
+    if (await page.evaluate(() => document.documentElement.dataset.skin) !== "toolza") throw new Error("по умолчанию не «Классика»");
     await shot("30-tunnels");
   });
-  await step("WARP", async () => { await page.click("[data-name=WARP] .name"); await page.waitForSelector("text=Бэкенд"); await shot("31-warp"); });
+  await step("WARP", async () => { await page.click("[data-name=WARP] .kc-n"); await page.waitForSelector("text=Бэкенд"); await shot("31-warp"); });
   await step("клиенты в WARP", async () => {
     await nav("/tunnels/warp/clients", ".item");
     await page.click(".item >> text=alice");
@@ -609,6 +687,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector(".item >> text=n1");
     await page.waitForSelector("[data-tunnel=on] .switch.on");
     await page.waitForSelector("[data-tunnel=on] >> text=включён · все клиенты");
+    // Проверка выхода в интернет через ноду — следом, в журнал на том же экране
+    await page.waitForSelector(".card >> text=выхода в интернет нет");
     await shot("35-exits");
     await page.click(".exmode button:has-text('Выбранные')");
     await page.waitForSelector(".exl .item[data-name=alice]");
@@ -667,7 +747,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   });
   await step("DNS", async () => { await nav("/tunnels/dns", "text=Включить"); await shot("39-dns"); });
   await step("всё напрямую", async () => {
-    await nav("/tunnels", ".ecard");
+    await nav("/tunnels", ".kcard");
     await page.click("text=Всё напрямую");
     await page.waitForSelector(".toast >> text=клиенты идут напрямую");
   });
@@ -796,6 +876,30 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click("[data-name=traffic] .chips button >> text=Все");
     await page.waitForSelector("[data-name=traffic] .chart .bar");
   });
+  await step("обзор: опоздавший график дорисовывается без новых запросов сводки и клиентов", async () => {
+    await nav("/clients", "[data-name]");
+    const seen = { status: 0, clients: 0 };
+    const onReq = (r) => { const m = /\/api\/(status|clients)$/.exec(r.url()); if (m) seen[m[1]]++; };
+    let release;
+    const gate = new Promise((ok) => { release = ok; });
+    const slow = async (r) => { if ((r.request().postData() || "").includes('"traffic","daily"')) await gate; await r.continue(); };
+    page.on("request", onReq);
+    await page.route("**/api/call", slow);
+    try {
+      await page.evaluate(() => { location.hash = "/"; });
+      await page.waitForFunction(() => { const a = document.getElementById("app"); return !a.querySelector(".spin") && !a.classList.contains("reloading"); });
+      await page.waitForTimeout(500);
+      if (await page.locator("[data-name=traffic] .chart").count()) throw new Error("график ещё не пришёл, а он на экране");
+      release();
+      await page.waitForSelector("[data-name=traffic] .chart");
+      await page.waitForTimeout(300);
+      if (seen.status !== 1 || seen.clients !== 1) throw new Error("дорисовка запросила заново: " + JSON.stringify(seen));
+    } finally {
+      release();
+      page.off("request", onReq);
+      await page.unroute("**/api/call", slow);
+    }
+  });
   await step("диагностика", async () => { await nav("/diag", "text=Система"); await shot("40-diag"); });
   await step("домены мимикрии", async () => {
     await page.click("text=Домены мимикрии: мир");
@@ -808,12 +912,12 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.route(/\/api\/job\/status$/, (r) => r.abort());
     try {
       await page.click("text=Домены мимикрии: мир");
-      await page.waitForSelector("h1 .pill:has-text('нет связи')", { timeout: 20000 });
+      await page.waitForSelector(".jobhead .pill:has-text('нет связи')", { timeout: 20000 });
       await page.waitForSelector("text=задача могла продолжиться на сервере");
       await page.waitForSelector("button:has-text('Назад')");
     } finally { await page.unroute(/\/api\/job\/status$/); await page.evaluate(() => { delete window.AWG_JOB_LOST_MS; }); }
     await page.click("button:has-text('Повторить проверку')");
-    await page.waitForFunction(() => /готово|ошибка/.test((document.querySelector("#app h1 .pill") || {}).textContent || ""),
+    await page.waitForFunction(() => /готово|ошибка/.test((document.querySelector("#app .jobhead .pill") || {}).textContent || ""),
       null, { timeout: 90000 });
   });
   await step("задача: ушли с экрана — итог подсказкой", async () => {
@@ -822,7 +926,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.route(/\/api\/job\/status$/, async (r) => { await new Promise((ok) => setTimeout(ok, 2500)); r.continue().catch(() => {}); });
     try {
       await page.click("text=Домены мимикрии: мир");
-      await page.waitForSelector("h1 .pill:has-text('идёт')");
+      await page.waitForSelector(".jobhead .pill:has-text('идёт')");
       await page.evaluate(() => { location.hash = "/server"; });
       await page.waitForSelector("text=Endpoint");
       await page.waitForSelector(".toast >> text=/Домены мимикрии \\(мир\\): (готово|ошибка)/", { timeout: 90000 });
@@ -876,7 +980,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   });
   await step("восстановление", async () => {
     await page.click("button:has-text('Восстановить')");
-    await page.waitForSelector("h1:has-text('Восстановление из бэкапа') .pill.ok", { timeout: 90000 });
+    await page.waitForSelector("h1:has-text('Восстановление из бэкапа') + .jobhead .pill.ok", { timeout: 90000 });
     await shot("46-restored");
   });
   await step("не бэкап — понятная ошибка", async () => {
@@ -902,6 +1006,34 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector(".chlog li >> text=со второй строкой");
     if (await page.locator(".chlog-v >> text=v1.1.1").count()) throw new Error("в списке изменений — уже установленная версия");
     await shot("48-update-available");
+  });
+  await step("обновление: шкала по этапам журнала, в конце — 100% и зелёная", async () => {
+    // Задача подставная: настоящее обновление заменило бы awg2 стенда
+    const ver = await page.evaluate(() => S.version);
+    const steps = [["running", "→ Канал: стабильный\n"], ["running", "→ Прежняя версия: /usr/local/bin/awg2.bak\n"],
+      ["done", "√ Установлено: " + ver + "\n"]];
+    let i = 0;
+    await page.route("**/api/job", (r) => r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: { id: "fake1" } }) }));
+    await page.route("**/api/job/status", (r) => {
+      const [state, log] = steps[Math.min(i, steps.length - 1)]; i++;
+      r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data:
+        { state, log, offset: i, ok: state === "done", data: { version: ver } } }) });
+    });
+    try {
+      await page.click("button:has-text('Обновить до v9.9.9')");
+      await page.waitForSelector(".jobhead .jbar");
+      await page.waitForFunction(() => +document.querySelector(".jbar").getAttribute("aria-valuenow") >= 75, null, { timeout: 15000 });
+      await page.waitForSelector(".jobhead .jbar.ok[aria-valuenow='100']", { timeout: 15000 });
+      await page.waitForSelector(".jobhead .jt >> text=/^100% · /");
+      await shot("48a-update-bar");
+    } finally {
+      // Подмена задач — только для этого шага: иначе следующие задачи получили бы её ответы
+      await page.unroute("**/api/job"); await page.unroute("**/api/job/status");
+    }
+    const r = await page.evaluate(() => [jobReached(JOB_STAGES["bot update"], "Скачиваю код бота\nЗависимости Python..."),
+      jobReached(JOB_STAGES["bot update"], "")]);
+    if (JSON.stringify(r) !== "[[30,75],[0,5]]") throw new Error("этапы обновления бота: " + JSON.stringify(r));
+    await nav("/update", "text=Канал");
   });
   await step("стрелка ↑ у версии в шапке", async () => {
     await page.waitForSelector(".top .lockup text >> text=↑");
@@ -1184,11 +1316,12 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot", "text=Уведомления");
     await page.click("text=Уведомления");
     await page.waitForSelector("h1:has-text('Уведомления')");
-    if (await page.locator(".switch.on").count() !== 6) throw new Error("ждали 6 включённых уведомлений");
+    if (await page.locator(".switch.on").count() !== 7) throw new Error("ждали 7 включённых уведомлений");
+    await page.waitForSelector(".card.item:has-text('Пятница: поддержать проект') >> text=только владельцу");
     await page.click(".card.item >> text=Диск заполнен");
-    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 5);
+    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 6);
     await nav("/bot/alerts", ".switch");
-    if (await page.locator(".switch.on").count() !== 5) throw new Error("выключенное уведомление не сохранилось");
+    if (await page.locator(".switch.on").count() !== 6) throw new Error("выключенное уведомление не сохранилось");
     await shot("52a-alerts");
   });
   await step("меню бота в чат", async () => {
@@ -1228,7 +1361,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot/app", "text=Сервер панели");
     await shot("56-app");
     await page.click("button:has-text('На IP')");
-    await page.waitForSelector("h1:has-text('Сертификат на IP') .pill.ok", { timeout: 60000 });
+    await page.waitForSelector("h1:has-text('Сертификат на IP') + .jobhead .pill.ok", { timeout: 60000 });
     // Сервер Mini App перезапускается через секунду после выпуска — дальше идём, когда он снова на месте
     await page.waitForTimeout(3000);
   });
@@ -1239,6 +1372,172 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       if (!labels.some((l) => l.startsWith(t))) throw new Error("нет раздела " + t + ": " + labels.join(", "));
     }
   });
+
+  // ── Стиль «Карточки»: включается в «Теме», меню в шапке, туннели и клиенты карточками ──
+  await step("«Карточки»: включаются в «Теме», шрифт Plex, меню в шапке вместо нижней панели", async () => {
+    await nav("/", "h1");
+    await page.click(".top button[aria-label='Тема']");
+    await page.click(".drawer.on [data-name=skin] button:has-text('Карточки')");
+    await page.waitForSelector(".drawer.on [data-name=skin] button.on:has-text('Карточки')");
+    await page.click(".drawer.on button:has-text('Готово')");
+    const st = await page.evaluate(() => ({ skin: document.documentElement.dataset.skin, rb: document.documentElement.style.getPropertyValue("--rb").trim(),
+      font: getComputedStyle(document.body).fontFamily, tabs: getComputedStyle(document.getElementById("tabbar")).display }));
+    if (st.skin !== "cards" || st.rb !== "20px" || !/IBM Plex Sans/.test(st.font) || st.tabs !== "none") throw new Error(JSON.stringify(st));
+    await page.waitForFunction(() => [...document.fonts].some((f) => f.family.indexOf("IBM Plex Sans") >= 0 && f.status === "loaded"), null, { timeout: 5000 })
+      .catch(() => { throw new Error("шрифт Plex не загрузился"); });
+    await page.click(".top .kburger");
+    await page.waitForSelector("#more.on .kmenu a:has-text('Бэкапы')");
+    if (await page.getAttribute(".top .kburger", "aria-expanded") !== "true") throw new Error("aria-expanded у меню");
+    await shot("80-cards-menu");
+    await page.click("#more .kmenu a:has-text('Бэкапы')");
+    await page.waitForURL(/#\/backup$/);
+    if (await page.locator("#more.on").count()) throw new Error("меню не закрылось");
+  });
+  await step("«Карточки»: туннели — вкладки, сводка, карточки, вид, скрытый адрес ноды", async () => {
+    await nav("/tunnels", ".kstats");
+    if (await page.locator(".ktabs button").count() !== 3 || await page.locator(".kstats > div").count() !== 4) throw new Error("вкладки/сводка");
+    for (const t of ["WARP", "Xray", "tun2socks", "Exit-ноды WG"]) await page.waitForSelector(`.kcard[data-name='${t}']`);
+    await page.waitForSelector(".kcard[data-name='Шифрованный DNS']");
+    await shot("81-cards-tunnels");
+    // Вид «Список» — без подробностей, запоминается
+    await page.click(".ktools .seg button[aria-label='Список']");
+    if (await page.locator(".kcard .kc-kv").count()) throw new Error("в списке — подробности");
+    await nav("/tunnels", ".kstats");
+    if (await page.locator(".ktools .seg button.on[aria-label='Список']").count() !== 1) throw new Error("вид не запомнился");
+    await page.click(".ktools .seg button[aria-label='Сетка']");
+    await page.waitForSelector(".kcard .kc-kv.g2", { state: "attached" }).catch(() => {});
+    await page.click(".ktools .seg button[aria-label='Подробно']");
+    // Поиск по карточкам
+    await page.fill(".ktools input[type=search]", "warp");
+    if (await page.locator(".klist .kcard").count() !== 1) throw new Error("поиск: " + await page.locator(".klist .kcard").count());
+    await page.fill(".ktools input[type=search]", "");
+    if (profile !== "none") {
+      await page.waitForSelector(".kcard.on[data-tunnel=exits] .kswitch[aria-checked=true]");
+      await page.click(".ktabs button[data-tab=nodes]");
+      const node = page.locator(".kcard[data-name=node-n1]");
+      await node.waitFor();
+      if ((await node.textContent()).includes("1.2.3.4")) throw new Error("адрес ноды не скрыт");
+      await node.locator(".eyeb").click();
+      await node.locator("text=1.2.3.4:51820").waitFor();
+      await shot("82-cards-nodes");
+      await page.click(".ktabs button[data-tab=xray]");
+      await page.waitForSelector(".kempty button:has-text('Установить Xray')");
+      await page.click(".ktabs button[data-tab=tun]");
+    }
+  });
+  await step("«Карточки»: клиенты — сводка, карточка с графиком, окно графика, выбор", async () => {
+    await nav("/clients", ".kstats");
+    if (await page.locator(".ktabs button").count() !== 4) throw new Error("вкладки фильтров");
+    const first = page.locator(".klist .kcard").first();
+    if (!await first.count()) { await page.waitForSelector(".kempty"); return; }
+    await first.locator(".kc-ch svg path.ln").waitFor({ timeout: 10000 });
+    await page.waitForSelector(".kstats .lb >> text=За 14 дней");
+    await shot("83-cards-clients");
+    await first.locator(".kc-ch").click();
+    await page.waitForSelector(".kchs .chart svg");
+    await page.click(".kchs .kpills button:has-text('7 дн.')");
+    await page.waitForSelector(".kchs .kpills button.on:has-text('7 дн.')");
+    await page.waitForFunction(() => /последние 7/.test(document.querySelector(".kchs").textContent));
+    await shot("84-cards-chart");
+    await page.keyboard.press("Escape");
+    await page.click(".kline button[aria-label='Выбрать несколько']");
+    await first.locator(".kc-h").click();
+    await page.waitForSelector(".klist .kcard.sel");
+    await page.waitForSelector(".bar button:has-text('Удалить 1')");
+    await page.click(".bar button:has-text('Отмена')");
+    if (await page.locator(".klist .kcard.sel").count()) throw new Error("выбор не снялся");
+  });
+  await step("«Карточки» в старом движке (Edge 18): туннели, клиенты, меню — без ошибок", async () => {
+    const p4 = await ctx.newPage();
+    const errs = [];
+    p4.on("pageerror", (e) => errs.push(String(e)));
+    await p4.addInitScript(() => {
+      window.AWG_FORCE_NOGAP = true;
+      delete Array.prototype.flat; delete Object.fromEntries; delete String.prototype.trimStart;
+      [Element, Document, DocumentFragment].forEach((C) => { delete C.prototype.replaceChildren; });
+      try { Object.defineProperty(document, "fonts", { get: () => undefined }); } catch (_) { /* нет — так нет */ }
+    });
+    await p4.goto(base + "#/tunnels", { waitUntil: "domcontentloaded" });
+    await p4.waitForSelector(".kstats .lb");
+    if (await p4.locator(".boot-fail").count()) throw new Error(await p4.textContent(".boot-fail"));
+    if (!await p4.locator(".kcard [data-gapm], .ktabs [data-gapm]").count()) throw new Error("обход gap у flex в карточках не сработал");
+    await p4.click(".ktabs button[data-tab=nodes]");
+    await p4.evaluate(() => { location.hash = "#/clients"; });
+    await p4.waitForSelector(".kstats .lb");
+    await p4.click(".top .kburger");
+    await p4.waitForSelector("#more.on .kmenu a");
+    if (errs.length) throw new Error(errs.join(" | "));
+    await p4.close();
+  });
+  if (profile !== "none") {
+    await step("«Карточки»: переключатель выключает туннель (с вопросом), awg2 отвечает", async () => {
+      await nav("/tunnels", ".kstats");
+      await page.click(".ktabs button[data-tab=tun]");          // вкладка запоминается — прошлый шаг мог оставить другую
+      // systemctl песочницы — заглушка: служба «работает» и после остановки, поэтому
+      // проверяем вопрос и ответ awg2 на exits down, а не состояние после
+      await page.click(".kcard[data-tunnel=exits] .kswitch");
+      await page.waitForSelector(".toast >> text=Exit-ноды выключены", { timeout: 30000 });
+      const asked = (await page.evaluate(() => window.__log)).some((l) => l.startsWith("confirm:Выключить Exit-ноды WG?"));
+      if (!asked) throw new Error("не спросил");
+      await page.waitForSelector(".kstats");                     // экран перерисован после действия
+    });
+  }
+
+  // ── Все экраны: низ содержимого не под нижней панелью и плашкой действий, страница не шире экрана ──
+  if (profile === "lite") {
+    await step("все экраны: ничего не уходит под нижнюю панель и плашку действий, нет прокрутки вбок", async () => {
+      const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
+        + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /client/alice/speed /clients "
+        + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/antiscan /server/create /server/endpoint /server/module "
+        + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
+        + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
+        + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");
+      const bad = [];
+      for (const [skin, w, hgt] of [["toolza", 390, 844], ["cards", 390, 844], ["toolza", 320, 640]]) {
+        const c = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: w, height: hgt } });
+        await c.route(/telegram\.org/, (r) => r.abort());
+        await c.addInitScript(({ initData, theme, skin }) => {
+          const noop = () => {};
+          window.Telegram = { WebApp: { initData, colorScheme: theme, ready: noop, expand: noop, onEvent: noop, close: noop,
+            BackButton: { show: noop, hide: noop, onClick: noop }, HapticFeedback: { notificationOccurred: noop },
+            showConfirm: (t, cb) => cb(false), showAlert: noop } };
+          try { localStorage.setItem("awg-look", JSON.stringify({ skin })); } catch (_) { /* без localStorage — как есть */ }
+        }, { initData, theme, skin });
+        const p = await c.newPage();
+        p.on("pageerror", (e) => bad.push(`${skin} ${w} ${p.url().split("#")[1]}: ${e}`));
+        for (const r of routes) {
+          await p.goto(base + "#" + r, { waitUntil: "domcontentloaded" });
+          await p.waitForFunction(() => { const a = document.getElementById("app"); return a && a.childElementCount && !a.querySelector(":scope > .spin"); },
+            null, { timeout: 15000 }).catch(() => {});
+          await p.waitForTimeout(700);
+          await p.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+          await p.waitForTimeout(300);
+          const m = await p.evaluate(() => {
+            const vis = (el) => { const cs = getComputedStyle(el); return cs.display !== "none" && cs.visibility !== "hidden"; };
+            const pinned = (el) => { for (let x = el; x && x !== document.body; x = x.parentElement) {
+              const pos = getComputedStyle(x).position; if (pos === "fixed" || pos === "sticky") return true; } return false; };
+            let bottom = 0, who = "";
+            document.querySelectorAll("#app *").forEach((el) => {
+              if (!vis(el) || pinned(el) || el instanceof SVGElement && el.tagName !== "svg") return;
+              if (el.closest("details:not([open]) > :not(summary)")) return;   // свёрнутое — не на экране
+              const b = el.getBoundingClientRect();
+              if (b.width > 0 && b.height > 0 && b.bottom > bottom) { bottom = b.bottom; who = el.tagName.toLowerCase() + "." + String(el.className).split(" ")[0]; }
+            });
+            // Нижняя панель разделов и плашка «Сбросить / Применить» стоят поверх страницы
+            let top = innerHeight;
+            const tb = document.getElementById("tabbar");
+            if (tb && vis(tb) && tb.childElementCount) top = Math.min(top, tb.getBoundingClientRect().top);
+            document.querySelectorAll("#app > .bar").forEach((b) => { if (vis(b)) top = Math.min(top, b.getBoundingClientRect().top); });
+            return { over: Math.round(bottom - top), who, wide: document.documentElement.scrollWidth - document.documentElement.clientWidth };
+          });
+          if (m.over > 0) bad.push(`${skin} ${w} ${r}: ${m.who} под панелью на ${m.over}px`);
+          if (m.wide > 0) bad.push(`${skin} ${w} ${r}: шире экрана на ${m.wide}px`);
+        }
+        await c.close();
+      }
+      if (bad.length) throw new Error(bad.join("; "));
+    });
+  }
 
   const log = await page.evaluate(() => window.__log);
   say("ALERTS", JSON.stringify(log.filter((l) => l.startsWith("alert:"))));
