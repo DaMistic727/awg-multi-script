@@ -293,6 +293,11 @@ const limitText = (c) => `${fmtBytes(c.used)} из ${fmtBytes(c.limit)} ${PERIOD
 // Скорость клиента: своя или замедление по лимиту (действует меньшая); пусто — без ограничения
 const speedNow = (c) => (c.slowed && c.limit_slow && !(c.speed && c.speed < c.limit_slow) ? c.limit_slow : c.speed || 0);
 const speedText = (c) => (!speedNow(c) ? "" : speedNow(c) === c.speed ? `${c.speed} Мбит/с` : `🐢 ${c.limit_slow} Мбит/с — лимит исчерпан`);
+// Повреждённые метки (bad_meta из awg2): срок и лимит — клиент заблокирован, скорость и режим лимита не действуют
+const badMeta = (c, k) => Array.isArray(c.bad_meta) && c.bad_meta.includes(k);
+const BAD_META = { expires: "срок", limit: "лимит", limit_slow: "режим лимита", speed: "скорость" };
+const badMetaText = (c) => (Array.isArray(c.bad_meta) && c.bad_meta.length
+  ? "повреждена метка: " + c.bad_meta.map((k) => BAD_META[k] || k).join(", ") : "");
 const SPEEDS = [5, 10, 20, 50, 100];
 const SLOW_MODES = [["block", "🚫 Блокировать"], ["1", "🐢 1 Мбит/с"], ["2", "🐢 2 Мбит/с"], ["5", "🐢 5 Мбит/с"]];
 
@@ -315,6 +320,7 @@ const EMOJI_ICON = {
   "🔐": "lock-keyhole", "🧪": "flask-conical", "🖥": "server", "🛡": "shield", "📁": "folder", "🗜": "file-archive",
   "◀": "arrow-left", "✅": "circle-check", "❌": "circle-x", "✖": "x", "🔃": "arrow-down-up", "📂": "folder",
   "👮": "user", "🎨": "palette", "📶": "gauge", "🚀": "zap", "🐢": "timer", "🚫": "circle-x", "📊": "chart-column", "📈": "chart-column", "🕒": "clock", "🎛": "sliders-horizontal", "↩": "undo-2", "💬": "message-square-text", "📱": "smartphone", "🔗": "share-2", "🙋": "user-plus", "🧯": "eraser",
+  "🐳": "arrow-left-right", "🚚": "arrow-left-right",
 };
 // \p{…} старый движок не знает (вся панель падала на этой строке) — там
 // эмодзи узнаётся по суррогатной паре или блоку символов
@@ -1865,6 +1871,9 @@ const EV_KIND = {
   unlimit: ["circle-check", "var(--ok)", (n, x) => [`${n} разблокирован`, x]],
   expired: ["hourglass", "var(--red)", (n, x) => [`${n}: срок истёк`, x]],
   warn1h: ["clock", "var(--amber)", (n, x) => [`${n}: срок истекает через час`, x]],
+  meta: ["shield-off", "var(--red)", (n, x) => [`${n} заблокирован`, x]],
+  unmeta: ["circle-check", "var(--ok)", (n, x) => [`${n}: метки исправлены`, x]],
+  badmeta: ["triangle-alert", "var(--amber)", (n, x) => [`${n}: метка не действует`, x]],
   watchdog: ["refresh-cw", "var(--blue)", (n, x) => ["Таймер сроков и лимитов перезапущен", [n, x].filter(Boolean).join(" ")]],
 };
 function parseEvents(log) {
@@ -2024,7 +2033,8 @@ route(/^\/$/, async (ctx) => {
   const eyebrow = now.toLocaleDateString("ru-RU", { weekday: "long", day: "numeric", month: "long" }) + " · "
     + now.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
   const online = rows.filter((c) => c.online).length, byLimit = rows.filter((c) => c.blocked && c.blocked_by === "traffic").length;
-  const byExp = rows.filter((c) => c.blocked && c.blocked_by !== "traffic").length;
+  const byExp = rows.filter((c) => c.blocked && c.blocked_by === "expire").length;
+  const byMeta = rows.filter((c) => c.blocked && c.blocked_by === "meta").length;
   const today = rows.reduce((a, c) => a + (c.today || 0), 0), month = rows.reduce((a, c) => a + (c.month || 0), 0);
   const foot = h("div", { class: "foot" }, WEB ? `${me.name} · веб-панель · ${me.bot}` : `${me.name} · ${me.owner ? "владелец" : "админ"} · бот ${me.bot}`);
   // Список клиентов не пришёл — не «Клиентов пока нет» и «Лимитов нет», а честно и с повтором
@@ -2115,7 +2125,8 @@ route(/^\/$/, async (ctx) => {
       setPref("routes-pane", i ? "w" : "awg"); rhLink.replaceChildren(rlink(i)); })) : routesIn;
   const subText = () => [`${rows.filter((c) => c.online).length} из ${rows.length} ${plural(rows.length, "клиента", "клиентов", "клиентов")} в сети`,
     byLimit ? `${byLimit} ${plural(byLimit, "заблокирован", "заблокированы", "заблокированы")} по лимиту` : null,
-    byExp ? `${byExp} с истёкшим сроком` : null, wrows.length ? `обфускатор: ${won} из ${wrows.length} в сети` : null,
+    byExp ? `${byExp} с истёкшим сроком` : null,
+    byMeta ? `${byMeta} ${plural(byMeta, "заблокирован", "заблокированы", "заблокированы")}: повреждена метка` : null, wrows.length ? `обфускатор: ${won} из ${wrows.length} в сети` : null,
     alerts.length ? "есть замечания" : "сервер без замечаний"].filter(Boolean).join(" · ");
   const sub = h("span", {}, subText()), kOnline = h("span", {}, String(online));
 
@@ -2200,7 +2211,7 @@ route(/^\/$/, async (ctx) => {
 const FILTERS = [["all", "Все"], ["online", "Онлайн"], ["blocked", "Заблок."], ["mon", "Мониторинг"]];
 const EXPIRES = [["", "♾ Бессрочно"], ["+1h", "1 час"], ["+1d", "1 день"], ["+7d", "7 дней"], ["+30d", "30 дней"]];
 
-const blockedWord = (c) => (c.blocked_by === "traffic" ? "лимит исчерпан" : "срок истёк");
+const blockedWord = (c) => (c.blocked_by === "traffic" ? "лимит исчерпан" : c.blocked_by === "meta" ? "метка повреждена" : "срок истёк");
 function seen(c) {
   if (c.blocked) return blockedWord(c);
   if (c.online) return "онлайн";
@@ -2245,8 +2256,9 @@ function routeTag(c, r) {
 function clientTags(c) {
   const left = c.expires ? c.expires - Date.now() / 1000 : 0;
   return [
-    c.mimicry && c.mimicry !== "none" ? tag(c.mimicry, "accent", "drama") : tag("без I1-I5"),
+    c.amnezia ? tag("из Amnezia", "", "package") : c.mimicry && c.mimicry !== "none" ? tag(c.mimicry, "accent", "drama") : tag("без I1-I5"),
     expLive(c) ? tag(expShort(c.expires), left < 3 * 86400 ? "warn" : "", "hourglass") : null,
+    badMetaText(c) ? tag(badMetaText(c), "bad", "triangle-alert") : null,
     c.limit ? tag(`лимит ${Math.min(999, Math.round(c.used * 100 / c.limit))}%`, c.used >= c.limit * 0.9 ? "warn" : "", "gauge") : null,
     speedNow(c) ? tag(`${speedNow(c)} Мбит/с`, speedNow(c) !== c.speed ? "warn" : "", speedNow(c) !== c.speed ? "timer" : "zap") : null,
     routeTag(c, (S.clients && S.clients.route) || {}),
@@ -2326,6 +2338,28 @@ function kcard({ state = "", cls = "", name, iface, chips, right, kv, view = "fu
       rows.map(([k, v]) => h("div", {}, h("span", {}, k), h("b", {}, v)))) : null,
     view === "list" ? null : extra || null,
     acts && acts.length ? h("div", { class: "kc-a" }, acts) : null);
+}
+// Пустые клетки после плотной укладки (grid-auto-flow: dense) на cols колонок;
+// items — [ширина, высота] в клетках, по порядку
+function gridHoles(items, cols) {
+  const g = [];
+  const free = (r, c, w, ht) => {
+    for (let y = r; y < r + ht; y++) for (let x = c; x < c + w; x++) if (g[y] && g[y][x]) return false;
+    return true;
+  };
+  let rows = 0, used = 0;
+  items.forEach(([w0, ht]) => {
+    const w = Math.min(w0, cols);
+    for (let r = 0; ; r++) {
+      for (let c = 0; c + w <= cols; c++) {
+        if (!free(r, c, w, ht)) continue;
+        for (let y = r; y < r + ht; y++) { g[y] = g[y] || []; for (let x = c; x < c + w; x++) g[y][x] = 1; }
+        rows = Math.max(rows, r + ht); used += w * ht;
+        return;
+      }
+    }
+  });
+  return rows * cols - used;
 }
 // Трафик карточки: принято, отдано, всего — счётчики интерфейса, с его запуска
 // (после перезапуска туннеля — снова с нуля)
@@ -2443,13 +2477,14 @@ const CLIENTS_RE = route(/^\/clients$/, async (ctx) => {
     return h("tr", { class: sel ? "sel" : null, "data-name": c.name, onclick: () => open(c) },
       S.select ? h("td", {}, mark(c)) : null,
       h("td", {}, h("div", { class: "who" }, ava(c), h("div", { style: "min-width:0" }, h("b", {}, c.name, c.mon ? " 🔔" : ""),
-        h("span", { class: "note" }, [c.ip, c.note].filter(Boolean).join(" · "))))),
+        h("span", { class: "note" }, [c.ip, c.note].filter(Boolean).join(" · ")),
+        badMetaText(c) ? h("span", { class: "note", style: "color:var(--red)" }, "⚠ " + badMetaText(c)) : null))),
       h("td", {}, statusPill(c)),
       h("td", { class: "num" }, c.today != null ? `${fmtBytes(c.today)} сегодня` : "—", h("br"),
         h("span", { class: "muted" }, `↓ ${fmtBytes(c.rx)} · ↑ ${fmtBytes(c.tx)}`)),
       h("td", {}, c.limit ? h("div", { class: "lim", title: limitText(c) }, ringSvg(pct, 26, 4), pct + "%") : h("span", { class: "muted" }, "—")),
       h("td", { class: "num", style: expActive && left < 3 * 86400 ? "color:var(--amber)" : null },
-        expActive ? expShort(c.expires) : c.expires ? "истёк" : "∞"),
+        expActive ? expShort(c.expires) : badMeta(c, "expires") ? "метка повреждена" : c.expires ? "истёк" : "∞"),
       h("td", {}, routeChip(c, mdl), c.mimicry && c.mimicry !== "none" ? h("div", { class: "muted small mono" }, c.mimicry) : null),
       h("td", {}, S.select ? null : h("div", { class: "ops" },
         op("qr-code", "Конфиг и QR", () => go(`/client/${enc}/qr`)),
@@ -2518,9 +2553,10 @@ const CLIENTS_RE = route(/^\/clients$/, async (ctx) => {
       chips: [c.mimicry && c.mimicry !== "none" ? kchip(c.mimicry, "acc", "drama") : kchip("без I1-I5"),
         expLive(c) ? kchip(expShort(c.expires), left < 3 * 86400 ? "warn" : "", "hourglass") : null,
         c.limit ? kchip(`лимит ${pct}%`, c.used >= c.limit * 0.9 ? "warn" : "", "gauge") : null,
+        badMetaText(c) ? kchip(badMetaText(c), "bad", "triangle-alert") : null,
         kroute(c), c.mon ? kchip("мониторинг", "", "bell") : null],
       kv: [["Рукопожатие", c.handshake ? fmtDur(c.ago) + " назад" : "не было"], ["Сегодня", fmtBytes(c.today || 0)],
-        ["Срок", expLive(c) && left > 0 ? "ещё " + expShort(c.expires) : c.expires ? "истёк" : "бессрочно"],
+        ["Срок", expLive(c) && left > 0 ? "ещё " + expShort(c.expires) : badMeta(c, "expires") ? "метка повреждена" : c.expires ? "истёк" : "бессрочно"],
         c.limit ? ["Лимит", `${pct}% · ${fmtBytes(c.used)} из ${fmtBytes(c.limit)}`] : null,
         v === "grid" ? ["Принято", "↓ " + fmtBytes(c.rx)] : null, v === "grid" ? ["Отдано", "↑ " + fmtBytes(c.tx)] : null,
         c.note ? ["Заметка", c.note] : null],
@@ -2694,18 +2730,21 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       [fmtBytes(c.rx), "Принято ↓", "от клиента"],
       [fmtBytes(c.tx), "Отдано ↑", "клиенту"],
       [c.handshake ? fmtDur(c.ago) : "—", "Рукопожатие", c.handshake ? (c.online ? "назад · онлайн" : "назад") : "не было"],
-      [c.expires ? expShort(c.expires) : "∞", "Срок", c.expires ? fmtTime(c.expires) : "бессрочно"],
+      [c.expires ? expShort(c.expires) : badMeta(c, "expires") ? "⚠" : "∞", "Срок", c.expires ? fmtTime(c.expires) : badMeta(c, "expires") ? "метка повреждена" : "бессрочно"],
     ])),
     area("info", h("div", { class: "card" },
       kv("IP", h("span", { class: "mono" }, c.ip)),
       c.endpoint ? kv("Адрес клиента", h("span", { class: "mono" }, c.endpoint.replace(/:\d+$/, ""))) : null,
-      kv("Мимикрия", h("span", { class: "mono" }, !c.mimicry || c.mimicry === "none" ? "без I1-I5" : c.mimicry)),
+      c.amnezia ? kv("Из Amnezia", (c.amnezia !== name ? `«${c.amnezia}» · ` : "") + "конфиг есть только у клиента")
+        : kv("Мимикрия", h("span", { class: "mono" }, !c.mimicry || c.mimicry === "none" ? "без I1-I5" : c.mimicry)),
       c.note ? kv("Заметка", c.note) : null), routeCard()),
     area("traf", h("div", { class: "card" },
       kv("За месяц", fmtBytes(c.month)), kv("Сегодня", fmtBytes(c.today)),
-      kv("Лимит", c.limit ? limitText(c) + (c.limit_slow ? ` · исчерпал — 🐢 до ${c.limit_slow} Мбит/с` : "") : "нет"),
+      kv("Лимит", badMeta(c, "limit") ? "метка повреждена — клиент заблокирован, задай лимит заново"
+        : (c.limit ? limitText(c) : "нет") + (badMeta(c, "limit_slow") ? " · режим: метка повреждена — при исчерпании блокировка"
+          : c.limit && c.limit_slow ? ` · исчерпал — 🐢 до ${c.limit_slow} Мбит/с` : "")),
       c.limit ? meter(c.used, c.limit) : null,
-      kv("Скорость", speedText(c) || "без ограничения"), chartBox)),
+      kv("Скорость", badMeta(c, "speed") ? "метка повреждена — не ограничивается, задай заново" : speedText(c) || "без ограничения"), chartBox)),
     // Сообщает Telegram-бот: в веб-панели без бота присылать некому — так и говорим
     area("mon", switchRow("Мониторинг активности", noBot() ? "уведомления присылает Telegram-бот — он не установлен"
       : "уведомления в чат, когда клиент пропал и вернулся", c.mon, async (on) => {
@@ -2714,12 +2753,13 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
         : "🔔 Бот сообщит, когда клиент пропадёт и вернётся", 3500);
     })),
     area("acts", h("div", { class: "actions" },
-      h("button", { class: "btn-primary", onclick: () => go(`/client/${enc}/qr`) }, icon("qr-code"), "Конфиг и QR"),
+      c.amnezia ? h("button", { class: "btn-primary", onclick: (ev) => reissue(ev.currentTarget, name) }, "🔁 Перевыпустить конфиг")
+        : h("button", { class: "btn-primary", onclick: () => go(`/client/${enc}/qr`) }, icon("qr-code"), "Конфиг и QR"),
       h("button", { onclick: () => go(`/client/${enc}/rename`) }, "✏️ Имя"),
       h("button", { onclick: (ev) => setExpire(ev.currentTarget) }, "⏳ Срок"),
       h("button", { onclick: (ev) => setLimit(ev.currentTarget) }, "📶 Лимит"),
       h("button", { onclick: (ev) => setSpeed(ev.currentTarget) }, "🚀 Скорость"),
-      h("button", { onclick: () => go(`/client/${enc}/mimicry`) }, "🎭 Мимикрия"),
+      c.amnezia ? null : h("button", { onclick: () => go(`/client/${enc}/mimicry`) }, "🎭 Мимикрия"),
       h("button", { onclick: () => go(`/client/${enc}/note`) }, "📝 Заметка"))),
     // После удаления — шаг назад к списку, а не второй список поверх первого
     area("del", h("button", { class: "btn-danger btn-block", onclick: (ev) => removeClients(ev.currentTarget, [name],
@@ -2738,7 +2778,24 @@ const confBtns = (name, primary = true) => {
     h("button", { onclick: (ev) => busy(ev.currentTarget, () => deliver({ what: "conf_zip", name })) }, "🗜 Скачать ZIP"));
 };
 
+// Перенесён из Amnezia: приватный ключ только у клиента — конфиг Тулза перевыпускает
+// (новый ключ; прежний конфиг перестаёт подключаться)
+function reissue(btn, name) {
+  return quickAsk(btn, `Перевыпустить конфиг ${name}? Клиенту — новый ключ и QR; адрес, сроки, лимиты и маршрут остаются, `
+    + "а прежний конфиг перестанет подключаться — отправь клиенту новый.", "Новый конфиг готов", ["client", "reissue", name],
+  () => { S.clients = null; replace(`/client/${encodeURIComponent(name)}/qr`); });
+}
+
 route(/^\/client\/([^/]+)\/qr$/, async (ctx, name) => {
+  const c = await loadClients().then(() => byName(name)).catch(() => null);
+  if (c && c.amnezia) {
+    return ctx.put(title("📄 " + name),
+      h("div", { class: "card" }, h("b", {}, "🐳 Перенесён из Amnezia"),
+        h("div", { class: "muted small", style: "margin-top:6px" }, "Конфиг этого клиента есть только у него самого: "
+          + "приватного ключа на сервере нет. Он подключается со своим прежним конфигом. Новое устройство или потерянный "
+          + "конфиг — перевыпусти: новый ключ и QR, прежний конфиг перестанет работать.")),
+      h("button", { class: "btn-primary btn-block", onclick: (ev) => reissue(ev.currentTarget, name) }, "🔁 Перевыпустить конфиг"));
+  }
   const d = await post("/api/client/qr", { name });
   ctx.put(
     title("📄 " + name),
@@ -2841,6 +2898,7 @@ route(/^\/client\/([^/]+)\/limit$/, async (ctx, name) => {
   ctx.put(title("📶 Лимит · " + name),
     h("label", {}, "Размер: 50G, 500MB, 1.5T; число без буквы — гигабайты"), input, seg,
     h("label", {}, "Исчерпал лимит"), modes,
+    badMeta(c, "limit_slow") ? hint("Метка режима повреждена: сейчас при исчерпании — блокировка. Выбери режим заново.") : null,
     hint("«Блокировать» — клиент отключается, как истёкший; «замедлять» — остаётся на связи на малой скорости. "
       + "«В месяц» — счётчик обнуляется 1-го числа, и всё снимается само; «всего» — считается с этой минуты, без сброса."),
     enterTo(h("button", { class: "btn-primary btn-block", onclick: (ev) => busy(ev.currentTarget, async () => {
@@ -3039,7 +3097,8 @@ const DNS = [["Cloudflare", "1.1.1.1, 1.0.0.1"], ["Google", "8.8.8.8, 8.8.4.4"],
   ["Quad9", "9.9.9.9, 149.112.112.112"], ["Яндекс", "77.88.8.8, 77.88.8.1"]];
 
 route(/^\/server$/, async (ctx) => {
-  const r = await callR(["server", "info"]);
+  const [r, amz] = await Promise.all([callR(["server", "info"]), call("amnezia", "status").catch(() => null)]);
+  const amzOn = !!(amz && (amz.container || amz.migrated));
   // Подсказка о переходе на 3.1 — не предупреждение: сервер на 2.0 — обычный выбор,
   // а переход — в «Протоколе»; в карточке — только то, что правда требует внимания
   const d = r.data || {};
@@ -3062,12 +3121,19 @@ route(/^\/server$/, async (ctx) => {
       [d.net || "—", "Подсеть", "адреса клиентов"],
       [(d.mimicry || "none"), "Мимикрия", d.mimicry_domain || (d.mimicry && d.mimicry !== "none" ? "пакеты I1-I5" : "без I1-I5")],
     ]) : null,
-    !d.exists ? btn("✨ Создать сервер", () => go("/server/create"), "btn-block" + (d.installed ? " btn-primary" : "")) : null,
+    // Сервер Amnezia на этом VPS: перенос лучше создания — клиенты остаются со своими конфигами
+    !d.exists && amz && amz.container && !amz.migrated ? ecard({ name: "Найден сервер Amnezia", attrs: { "data-name": "amnezia" },
+      right: pill(amz.running ? "работает" : "остановлен", amz.running ? "ok" : "warn"),
+      lines: ["Перенеси его в Тулзу — клиенты останутся со своими конфигами, перевыдавать не нужно"],
+      acts: [act("arrow-left-right", "Перенос", () => go("/server/amnezia"))] }) : null,
+    !d.exists ? btn("✨ Создать сервер", () => go("/server/create"), "btn-block" + (d.installed && !(amz && amz.container) ? " btn-primary" : "")) : null,
     h("h2", {}, "Обслуживание"),
     h("div", { class: "card list" },
       d.exists ? menuItem("🎛 Параметры AWG", "Jc, S1-S4, H1-H4 вручную", () => go("/server/params")) : null,
       menuItem("🧩 Модуль ядра", "версии, обновление, откат", () => go("/server/module")),
       menuItem("🛡 Антисканер", "сети сканеров РКН и госорганов — не до портов сервера", () => go("/server/antiscan")),
+      amzOn ? menuItem("🐳 Перенос из Amnezia", amz.migrated ? "сделан — вернуть или удалить контейнер"
+        : "сервер из Docker-контейнера, клиенты без перевыдачи", () => go("/server/amnezia")) : null,
       menuItem(d.installed ? "📦 Компоненты" : "📦 Установить компоненты", "пакеты, модуль, amneziawg-tools",
         () => jobAsk(ctx, "Пакеты, заголовки ядра, сборка модуля AmneziaWG и amneziawg-tools из исходников. Обычно 5-15 минут. "
           + "Если ядру нет заголовков, поставится свежее ядро — тогда понадобится перезагрузка.", "Установка компонентов", ["server", "install"])),
@@ -3133,6 +3199,49 @@ route(/^\/server\/antiscan$/, async (ctx) => {
     h("div", { class: "main" }, h("div", { class: "title mono wrap" }, a)), h("div", { class: "side bad" }, icon("x"))))) : null,
     h("div", { class: "row", style: "gap:8px;margin-top:8px" }, ip, enterTo(add, ip)),
     hint("Клиенты VPN, которые подключаются из этих сетей, тоже не подключатся — для них есть исключения."));
+});
+
+// Перенос из Amnezia (Docker): сервер AWG из контейнера приложения AmneziaVPN — в awg0
+// Тулзы с теми же ключами и параметрами. Читает и переносит awg2, здесь — экран
+const AMZ_BLOCK = { server: "Сервер Тулзы уже создан — перенос только на сервер без своего awg0 (Сбросить сервер).",
+  components: "Сначала установи компоненты.", proto: "Модуль ядра не умеет эту версию AWG — обнови модуль." };
+route(/^\/server\/amnezia$/, async (ctx) => {
+  const d = (await call("amnezia", "scan")) || {};
+  if (d.migrated) {
+    return ctx.put(title("🐳 Перенос из Amnezia"),
+      h("div", { class: "card" }, kv("Статус", h("span", { class: "ok" }, "● перенос сделан")),
+        kv("Контейнер", h("span", { class: "mono" }, (d.container || "") + " — остановлен, не удалён"))),
+      hint("«Вернуть Amnezia» снимает awg0 Тулзы (перед этим — бэкап) и запускает контейнер. Клиенты, созданные в Тулзе "
+        + "после переноса, в Amnezia не попадут. Когда всё работает — контейнер можно удалить."),
+      h("div", { class: "actions" },
+        btn("↩️ Вернуть Amnezia", () => jobAsk(ctx, "Вернуть Amnezia? awg0 Тулзы будет снят, контейнер запустится снова.",
+          "Возврат Amnezia", ["amnezia", "revert"])),
+        btn("🗑 Удалить контейнер", (b) => quickAsk(b, "Удалить контейнер Amnezia навсегда? Вернуть Amnezia будет нельзя. "
+          + "Сервер и клиенты в Тулзе остаются.", "Контейнер удалён", ["amnezia", "remove"], () => replace("/server")))));
+  }
+  if (!d.container) return ctx.put(title("🐳 Перенос из Amnezia"), h("div", { class: "empty" }, "Контейнер Amnezia на сервере не найден"));
+  if (d.error) return ctx.put(title("🐳 Перенос из Amnezia"), h("div", { class: "card bad" }, "❌ " + d.error));
+  const cl = d.clients || [], blockers = d.blockers || [], errors = d.errors || [];
+  const ok = !blockers.length && !errors.length;
+  ctx.put(title("🐳 Перенос из Amnezia"),
+    h("div", { class: "card" },
+      kv("Контейнер", h("span", {}, h("span", { class: "mono" }, d.container), " · ", d.running ? "работает" : "остановлен")),
+      kv("Протокол", "AWG " + (d.proto || "?")), kv("Порт", d.port + "/udp"), kv("Подсеть", h("span", { class: "mono" }, d.net || "")),
+      kv("Клиентов", String(cl.length))),
+    [...(d.warnings || []).map((w) => h("div", { class: "small warn" }, "▲ " + w)),
+      ...errors.map((e) => h("div", { class: "small bad" }, "✖ " + e)),
+      ...blockers.map((b) => h("div", { class: "small bad" }, "✖ " + (AMZ_BLOCK[b] || b)))],
+    cl.length ? [h("h2", {}, "Клиенты"), h("div", { class: "card list" }, cl.map((c) => h("div", { class: "item" },
+      h("div", { class: "main" }, h("div", { class: "title" }, c.name),
+        h("div", { class: "sub mono" }, c.ip + (c.orig && c.orig !== c.name ? " · " + c.orig : ""))))))] : null,
+    hint("Ключи, порт и параметры — те же: клиенты подключаются со своими конфигами, перевыдавать не нужно. "
+      + "Приватных ключей клиентов на сервере нет — конфиг и QR им Тулза перевыпустит по просьбе. Приложение AmneziaVPN "
+      + "после переноса этим сервером не управляет (как клиент — работает)."),
+    ok ? btn("🚚 Перенести", () => jobAsk(ctx, "Перенести? Контейнер будет остановлен (не удалён), awg0 Тулзы поднимется с теми же "
+      + "ключами и портом. Клиенты на пару секунд потеряют связь и переподключатся сами. Не поднимется — Amnezia вернётся "
+      + "автоматически.", "Перенос из Amnezia", ["amnezia", "migrate"]), "btn-primary btn-block")
+      : blockers.includes("components") ? btn("📦 Установить компоненты", () => jobAsk(ctx, "Установить компоненты? Обычно 5-15 минут.",
+        "Установка компонентов", ["server", "install"]), "btn-block") : null);
 });
 
 // Создание сервера — те же вопросы, что задают меню awg2 и бот, одной формой
@@ -3603,20 +3712,32 @@ async function tunnelsCards(ctx) {
   function drawList() {
     // Карточка — [текст для поиска, построитель]: ищем по имени, интерфейсу, протоколу, адресу
     const rank = (k) => (d[k] === "up" ? 0 : has(k) || (k === "exits" && nodes.length) ? 1 : 2);
-    const items = tab === "tun" ? keys.slice().sort((a, b) => rank(a) - rank(b)).map((k) => [`${TUN_NAME[k]} ${k}`, () => engine(k)])
+    const items = tab === "tun" ? keys.slice().sort((a, b) => rank(a) - rank(b)).map((k) => [`${TUN_NAME[k]} ${k}`, () => engine(k), rank(k)])
       : tab === "nodes" ? nodes.map((n) => [`${n.name} awg-exit-${n.name} ${n.proto} ${n.endpoint || ""}`, () => nodeCard(n)])
         : outs.map((o) => [`${o.tag} ${o.proto} ${o.sec} ${o.net} ${o.host}`, () => outCard(o)]);
     const vis = items.filter(([t]) => !q || t.toLowerCase().indexOf(q) >= 0);
     const empty = (text, btn) => h("div", { class: "kempty" }, h("div", {}, text), btn || null);
+    let cards = vis.map((it) => it[1]());
+    // Высокие карточки (строки, трафик) — на две строки сетки, низкие заполняют
+    // место рядом с ними; осталась одна пустая клетка — последняя низкая во всю
+    // ширину двух колонок. В строчном виде карточки одной высоты — не нужно.
+    const tall = (c) => !!c.querySelector(".kc-kv, .kc-tr");
+    const mas = tab === "tun" && view !== "list" && cards.some(tall) && !cards.every(tall);
+    if (mas) {
+      cards = cards.filter(tall).concat(cards.filter((c) => !tall(c)));
+      cards.forEach((c) => { if (tall(c)) c.classList.add("ktall"); });
+      const dims = cards.map((c) => [1, tall(c) ? 2 : 1]), last = cards[cards.length - 1];
+      [2, 3].forEach((n) => { if (gridHoles(dims.slice(0, -1).concat([[2, 1]]), n) < gridHoles(dims, n)) last.classList.add("kw" + n); });
+    }
     listBox.replaceChildren(...[
-      vis.length ? h("div", { class: "klist" }, vis.map(([, mk]) => mk()))
+      cards.length ? h("div", { class: "klist" + (mas ? " kmas" : "") }, cards)
         : q ? empty("Ничего не нашлось")
           : tab === "nodes" ? empty("Нод нет — клиенты могут выходить в интернет через другие AWG/WG-серверы",
             h("button", { class: "btn-primary", onclick: () => go("/tunnels/exits/add") }, icon("plus"), "Добавить ноду"))
             : !has("xray") ? empty("Xray не установлен — выходы VLESS, VMess, Trojan, Shadowsocks, Hysteria2",
               h("button", { class: "btn-primary", onclick: () => runJob(ctx, "Установка Xray", ["xray", "install"]) }, icon("package"), "Установить Xray"))
               : empty("Выходов нет — добавь ссылкой", h("button", { class: "btn-primary", onclick: () => go("/tunnels/xray/add") }, icon("plus"), "Добавить выход")),
-      tab === "tun" && !q ? [h("div", { class: "ksec" }, h("h2", {}, "Ещё")), h("div", { class: "klist" }, extraCards()),
+      tab === "tun" && !q ? [h("div", { class: "ksec" }, h("h2", {}, "Ещё")), h("div", { class: "klist kpair" }, extraCards()),
         hint("Одновременно работает один туннель: включишь другой — текущий выключится.")] : null,
       tab === "xray" && outs.length > 1 && !q ? hint(X.per_client ? "Клиенту можно закрепить свой выход: Клиенты → клиент → Маршрут."
         : "Свой выход клиенту — только с inbound tun в самом Xray: обнови Xray.") : null].flat(Infinity).filter(Boolean));
@@ -3996,6 +4117,7 @@ route(/^\/tunnels\/dns$/, async (ctx) => {
   const d = r.data || {}, inst = d.installed;
   const norm = (s) => (s || "").split(/[\s,]+/).filter(Boolean).join(" ");
   const cur = norm(d.upstream);
+  const manual = !!cur && !(d.presets || []).some((p) => norm(p.names) === cur);
   async function off(b) {
     const v = await sheet("Выключить шифрованный DNS? Клиенты вернутся к DNS из своих конфигов.",
       [{ label: "⏹ Выключить", value: "off" }, { label: "🗑 Удалить совсем, с dnscrypt-proxy", value: "purge", cls: "bad" }]);
@@ -4008,8 +4130,9 @@ route(/^\/tunnels\/dns$/, async (ctx) => {
         (norm(p.names) === cur ? null : quick(null, "Резолверы изменены", ["dns", "upstream", p.names])) },
       h("div", { class: "radio" + (norm(p.names) === cur ? " on" : "") }),
       h("div", { class: "main" }, h("div", { class: "title" }, p.label), h("div", { class: "sub" }, p.names)))),
-      h("div", { class: "item", onclick: () => go("/tunnels/dns/manual") }, h("div", { class: "radio" }),
-        h("div", { class: "main" }, h("div", { class: "title" }, "✏️ Вручную…"), h("div", { class: "sub" }, "имена из public-resolvers"))))] : null,
+      h("div", { class: "item", onclick: () => go("/tunnels/dns/manual") }, h("div", { class: "radio" + (manual ? " on" : "") }),
+        h("div", { class: "main" }, h("div", { class: "title" }, "✏️ Вручную…"),
+          h("div", { class: "sub" }, manual ? cur : "имена из public-resolvers"))))] : null,
     h("div", { class: "actions", style: "margin-top:8px" },
       !inst ? btn("▶️ Включить", () => runJob(ctx, "Шифрованный DNS", ["dns", "install"]), "btn-primary") : null,
       !inst ? btn("⚠️ Принудительно", () => jobAsk(ctx, "Если на сервере работает свой DNS (Pi-hole, Unbound, bind), "
@@ -4022,12 +4145,30 @@ route(/^\/tunnels\/dns$/, async (ctx) => {
 
 route(/^\/tunnels\/dns\/manual$/, async (ctx) => {
   const d = (await call("dns", "status")) || {};
-  const names = h("input", { value: d.upstream || "", placeholder: "cloudflare, google", autocapitalize: "off", autocomplete: "off" });
+  const names = h("input", { value: (d.upstream || "").split(/[\s,]+/).filter(Boolean).join(", "), placeholder: "cloudflare, google",
+    autocapitalize: "off", autocomplete: "off" });
+  const picked = () => names.value.split(/[\s,]+/).filter(Boolean);
+  // Популярные — отметкой: нажатие добавляет имя в поле или убирает его
+  const pop = (d.popular || []).map((p) => {
+    const mark = h("div", { class: "check" });
+    const sync = () => { const on = picked().includes(p.name); mark.className = "check" + (on ? " on" : ""); mark.replaceChildren(...(on ? [icon("check")] : [])); };
+    sync();
+    return { sync, row: h("div", { class: "item", onclick: () => {
+      const l = picked(), i = l.indexOf(p.name);
+      if (i >= 0) l.splice(i, 1); else l.push(p.name);
+      names.value = l.join(", ");
+      pop.forEach((x) => x.sync());
+    } }, mark, h("div", { class: "main" }, h("div", { class: "title mono wrap" }, p.name), h("div", { class: "sub" }, p.label))) };
+  });
+  names.addEventListener("input", () => pop.forEach((x) => x.sync()));
   ctx.put(title("✏️ Резолверы"),
-    h("label", {}, "Имена через запятую — из списка public-resolvers (github.com/DNSCrypt/dnscrypt-resolvers)"), names,
+    h("label", {}, "Имена через запятую — из списка public-resolvers (github.com/DNSCrypt/dnscrypt-resolvers). Подходят только DoH."), names,
+    pop.length ? h("details", { class: "card list", style: "margin-top:10px" },
+      h("summary", { style: "padding:12px 14px" }, "Популярные резолверы (DoH) — " + pop.length), pop.map((x) => x.row)) : null,
     btn("Сохранить", (b) => {
-      const v = names.value.trim();
-      if (!/^[A-Za-z0-9_, -]+$/.test(v)) return fail(new Error("Допустимы латиница, цифры, дефис и запятая"));
+      const v = picked().join(",");
+      if (!v) return fail(new Error("Укажи хотя бы одно имя"));
+      if (!/^[A-Za-z0-9._,-]+$/.test(v)) return fail(new Error("Допустимы латиница, цифры, точка, дефис и запятая"));
       return quick(b, "Резолверы изменены", ["dns", "upstream", v], () => back());
     }, "btn-primary btn-block"));
 });

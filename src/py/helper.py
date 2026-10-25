@@ -6,6 +6,7 @@
 с целевым и os.replace: обрыв на середине не оставляет битый конфиг.
 """
 import base64
+import difflib
 import importlib
 import json
 import os
@@ -142,6 +143,14 @@ def cmd_peers(conf):
                          peer_meta(b, "speed"), peer_meta(b, "limit_slow"), peer_meta(b, "slowed_by")]))
 
 
+def cmd_meta_get(conf, name, key):
+    """Метка клиента по имени (пусто — нет метки или клиента)."""
+    _, peers = split_peers(read(conf))
+    i = find_peer(peers, name=name)
+    if i >= 0:
+        print(peer_meta(peers[i], key))
+
+
 def cmd_meta_set(conf, name, key, value):
     head, peers = split_peers(read(conf))
     i = find_peer(peers, name=name)
@@ -161,6 +170,42 @@ def cmd_peer_del(conf, pubkey):
     text = head + "".join(peers)
     write_atomic(conf, re.sub(r"\n{3,}", "\n\n", text))
     print(name)
+
+
+def cmd_peer_rekey(conf, pubkey, newpub, psk):
+    """Новый ключ клиенту (перевыпуск): PublicKey и PresharedKey заменяются,
+    метка «перенесён из Amnezia» снимается — конфиг теперь есть у Тулзы.
+    Печатает настоящий адрес клиента (у заблокированного — из orig_ips)."""
+    if not (_b64key(newpub) and _b64key(psk)):
+        die("ключ неверный")
+    head, peers = split_peers(read(conf))
+    i = find_peer(peers, pubkey=pubkey)
+    if i < 0:
+        die("пир не найден", 2)
+    b = re.sub(r"^([ \t]*PublicKey[ \t]*=[ \t]*).*$", lambda m: m.group(1) + newpub, peers[i], count=1, flags=re.M | re.I)
+    if re.search(r"^[ \t]*PresharedKey[ \t]*=", b, re.M | re.I):
+        b = re.sub(r"^([ \t]*PresharedKey[ \t]*=[ \t]*).*$", lambda m: m.group(1) + psk, b, count=1, flags=re.M | re.I)
+    else:
+        b = re.sub(r"^([ \t]*PublicKey[ \t]*=.*)$", lambda m: m.group(1) + "\nPresharedKey = " + psk, b, count=1,
+                   flags=re.M | re.I)
+    peers[i] = set_meta(b, "amnezia", "")
+    write_atomic(conf, head + "".join(peers))
+    print(peer_meta(peers[i], "orig_ips") or peer_field(peers[i], "AllowedIPs"))
+
+
+def cmd_traffic_rekey(db, old, new):
+    """Счётчики трафика и лимита клиента — на его новый ключ."""
+    lock = _traffic_lock(db)
+    t = Traffic(db)
+    for k in ("last", "total", "reset", "warned", "badmeta"):
+        if old in t.d[k]:
+            t.d[k][new] = t.d[k].pop(old)
+    for day in t.d["days"].values():
+        if isinstance(day, dict) and old in day:
+            day[new] = day.pop(old)
+    t.d["last"].pop(new, None)         # прежние показания ядра — у старого ключа
+    t.save()
+    del lock
 
 
 def cmd_peer_rename(conf, pubkey, new):
@@ -448,7 +493,13 @@ def cmd_expire_set(conf, name, ts):
     write_atomic(conf, head + "".join(peers))
 
 
-def cmd_expire_clear(conf, name, suspend):
+def cmd_expire_clear(conf, name, suspend, db="", transfer=""):
+    """Снять срок. Печатает, что держит клиента дальше: traffic — лимит
+    исчерпан (заблокирован), slow — лимит исчерпан (замедлен), meta —
+    повреждена другая метка; пусто — свободен. db и transfer — база трафика
+    и снимок счётчиков: исчерпавший лимит не получает адрес даже на время
+    до прохода таймера."""
+    lock = _traffic_lock(db) if db else None
     head, peers = split_peers(read(conf))
     i = find_peer(peers, name=name)
     if i < 0:
@@ -460,19 +511,43 @@ def cmd_expire_clear(conf, name, suspend):
         write_atomic(conf, head + "".join(peers))
         print("traffic")
         return
-    orig = peer_meta(b, "orig_ips")
-    if orig and peer_field(b, "AllowedIPs") == suspend:
-        b = re.sub(r"^([ \t]*AllowedIPs\s*=\s*).+$", lambda m: m.group(1) + orig, b, count=1, flags=re.M | re.I)
-    b = set_meta(set_meta(set_meta(b, "expires", ""), "orig_ips", ""), "blocked_by", "")
+    if peer_meta(b, "blocked_by") == "meta":
+        # Повреждённый срок уходит вместе со сроком; блокировка снимается,
+        # только если других повреждённых меток нет
+        b = set_meta(b, "expires", "")
+        b = _meta_guard(b, suspend, peer_field(b, "AllowedIPs"), int(time.time()), name)[0]
+    else:
+        b = set_meta(_unblock(b, suspend), "expires", "")
+    held = "meta" if peer_meta(b, "blocked_by") == "meta" else ""
+    if not held and db:
+        b, held = _limit_hold(b, suspend, Traffic(db), transfer)
     peers[i] = b
     write_atomic(conf, head + "".join(peers))
-    print(orig)
+    del lock
+    print(held)
+
+
+def _limit_hold(b, suspend, t, transfer=""):
+    """Только что разблокированный — сверка с лимитом: исчерпан — снова блок
+    за трафик или, в режиме «замедлять», замедление. → (блок, traffic|slow|"")."""
+    limit, period = parse_limit(peer_meta(b, "limit"))
+    aip, pub = peer_field(b, "AllowedIPs"), peer_field(b, "PublicKey")
+    if not limit or aip == suspend or not pub:
+        return b, ""
+    if transfer:
+        t.apply(_read_transfer(transfer), "")       # только в памяти: базу ведёт таймер
+    if t.used(pub, period) < limit:
+        return b, ""
+    if _mbit(peer_meta(b, "limit_slow")):
+        return set_meta(b, "slowed_by", "traffic"), "slow"
+    return _block(b, suspend, aip, "traffic"), "traffic"
 
 
 def cmd_expire_check(conf, suspend, state_dir):
     """Блокирует истёкших (AllowedIPs → suspend, исходный адрес в orig_ips)
     и предупреждает за час до срока. Печатает события построчно:
-    CHANGED; EXPIRED<TAB>имя<TAB>адрес; WARN1H<TAB>имя<TAB>минут."""
+    CHANGED; EXPIRED<TAB>имя<TAB>адрес; WARN1H<TAB>имя<TAB>минут;
+    META<TAB>имя<TAB>адрес|-<TAB>метки (снимает такую блокировку traffic-tick)."""
     try:
         text = read(conf)
     except OSError:
@@ -481,11 +556,18 @@ def cmd_expire_check(conf, suspend, state_dir):
     head, peers = split_peers(text)
     events, changed = [], False
     for i, b in enumerate(peers):
-        exp, pub, aip = peer_meta(b, "expires"), peer_field(b, "PublicKey"), peer_field(b, "AllowedIPs")
-        if not (exp.isdigit() and pub and aip):
+        pub, aip = peer_field(b, "PublicKey"), peer_field(b, "AllowedIPs")
+        if not (pub and aip):
             continue
-        exp = int(exp)
         name = peer_name(b) or pub[:8]
+        peers[i], aip, ev = _meta_guard(b, suspend, aip, now, name, release=False)
+        if ev:
+            b = peers[i]
+            changed = True
+            events.append(ev)
+        exp = meta_int(peer_meta(b, "expires"))
+        if peer_meta(b, "blocked_by") == "meta" or exp is None or exp is BAD:
+            continue
         if now >= exp and aip != suspend:
             if not peer_meta(b, "orig_ips"):
                 b = set_meta(b, "orig_ips", aip)
@@ -543,9 +625,14 @@ def parse_size(text):
 
 
 def parse_limit(value):
-    """Метка «БАЙТ/период» → (байт, период) или (0, "")."""
-    m = re.match(r"^(\d+)/(month|total)$", value or "")
-    return (int(m.group(1)), m.group(2)) if m else (0, "")
+    """Метка «БАЙТ/период» → (байт, период) или (0, "") — нет лимита или
+    метка повреждена (это отличает limit_bad)."""
+    m = re.fullmatch(r"([0-9]{1,16})/(month|total)", (value or "").strip())
+    return (int(m.group(1)), m.group(2)) if m and int(m.group(1)) else (0, "")
+
+
+def limit_bad(value):
+    return bool((value or "").strip()) and not parse_limit(value)[0]
 
 
 def _read_transfer(path):
@@ -563,7 +650,8 @@ def _read_transfer(path):
 class Traffic:
     """База трафика: {"v", "ifindex", "saved", "last": {pub: [rx, tx]},
     "total": {pub: n}, "days": {"ГГГГ-ММ-ДД": {pub: [rx, tx]}},
-    "reset": {pub: {"p": период, "b": байт}}, "warned": {pub: "период:лимит"}}."""
+    "reset": {pub: {"p": период, "b": байт}}, "warned": {pub: "период:лимит"},
+    "badmeta": {pub: "метки"}} — badmeta: о чём уже предупредили."""
 
     def __init__(self, path):
         self.path = path
@@ -575,7 +663,7 @@ class Traffic:
         if not isinstance(data, dict):
             data = {}
         self.d = {k: data.get(k) if isinstance(data.get(k), dict) else {}
-                  for k in ("last", "total", "days", "reset", "warned")}
+                  for k in ("last", "total", "days", "reset", "warned", "badmeta")}
         self.ifindex = str(data.get("ifindex") or "")
         self.saved = int(data.get("saved") or 0)
 
@@ -646,7 +734,7 @@ class Traffic:
         cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400 * DAYS_KEEP))
         self.d["days"] = {k: v for k, v in self.d["days"].items() if k >= cutoff and v}
         if alive is not None:
-            for k in ("last", "total", "reset", "warned"):
+            for k in ("last", "total", "reset", "warned", "badmeta"):
                 self.d[k] = {p: v for p, v in self.d[k].items() if p in alive}
         self.saved = int(time.time())
         data = dict(self.d, v=1, ifindex=self.ifindex, saved=self.saved)
@@ -675,11 +763,79 @@ PERIOD_WORD = {"month": "за месяц", "total": "всего"}
 
 
 def _mbit(value):
-    """Метка скорости (Мбит/с) → число; не число или 0 — 0 (без ограничения)."""
-    return int(value) if (value or "").isdigit() and 0 < int(value) <= SPEED_MAX else 0
+    """Метка скорости (Мбит/с) → число; не число или 0 — 0 (без ограничения).
+    isascii: «²» тоже isdigit(), а int() на нём падает — и весь план скорости с ним"""
+    v = value or ""
+    return int(v) if v.isascii() and v.isdigit() and 0 < int(v) <= SPEED_MAX else 0
 
 
 SPEED_MAX = 10000
+
+
+# ── Повреждённые метки ──
+# Числовые метки — только цифры ASCII: isdigit() пропускает «²» и «①», а int()
+# на них падает — вместе с проходом таймера по всем клиентам. Метку портят
+# руками или подменённым бэкапом (восстанавливать может и приглашённый админ).
+BAD = object()
+META_HARD = ("expires", "limit")       # без них неизвестно, можно ли пускать клиента
+
+
+def meta_int(value):
+    """«123» (пробелы по краям можно) → 123; пусто → None; иначе BAD."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    return int(v) if re.fullmatch(r"[0-9]{1,15}", v) else BAD
+
+
+def bad_meta(b):
+    """Повреждённые метки клиента: expires, limit, limit_slow, speed."""
+    out = [k for k in ("expires",) if meta_int(peer_meta(b, k)) is BAD]
+    if limit_bad(peer_meta(b, "limit")):
+        out.append("limit")
+    # Скорость и режим лимита — по правилу _mbit: только цифры ASCII, до SPEED_MAX; иначе
+    # _mbit молча дал бы «без ограничения», а предупреждения бы не было
+    for k in ("limit_slow", "speed"):
+        v = peer_meta(b, k)
+        if v and not (v.isascii() and v.isdigit() and int(v) <= SPEED_MAX):
+            out.append(k)
+    return out
+
+
+def _meta_guard(b, suspend, aip, now, name, release=True):
+    """Срок или лимит повреждён — неизвестно, истёк ли он и исчерпан ли
+    лимит, а «бессрочный без лимита» — не то, что задумано: клиент
+    блокируется своей причиной «# blocked_by=meta». Её не снимают ни новый
+    месяц, ни продление, ни смена режима — только исправленная метка; тогда
+    состояние считается заново (истёкший остаётся заблокирован сроком).
+    → (блок, AllowedIPs, событие или ""). Пустых полей в событиях нет — «-»:
+    read с IFS=таб схлопнул бы их. release=False — только блокировать:
+    expire-check снимать не должен — исчерпавшего лимит traffic-tick
+    заблокировал бы снова, но уже после того, как awg0 его пропустил."""
+    hard = [k for k in bad_meta(b) if k in META_HARD]
+    by = peer_meta(b, "blocked_by")
+    if hard:
+        if aip != suspend:
+            return _block(b, suspend, aip, "meta"), suspend, "META\t%s\t%s\t%s" % (name, aip, ", ".join(hard))
+        if by != "meta":
+            return set_meta(b, "blocked_by", "meta"), aip, "META\t%s\t-\t%s" % (name, ", ".join(hard))
+        return b, aip, ""
+    if by != "meta" or not release:
+        return b, aip, ""
+    exp = meta_int(peer_meta(b, "expires"))
+    if exp is not None and now >= exp:
+        return set_meta(b, "blocked_by", ""), aip, "UNMETA\t%s\texpire" % name
+    b = _unblock(b, suspend)
+    return b, peer_field(b, "AllowedIPs"), "UNMETA\t%s\t-" % name
+
+
+def cmd_meta_check(conf):
+    """Клиенты с повреждёнными метками: «имя<TAB>метки» — для восстановления."""
+    _, peers = split_peers(read(conf))
+    for b in peers:
+        bad = bad_meta(b)
+        if bad and peer_field(b, "PublicKey"):
+            print("%s\t%s" % (peer_name(b) or peer_field(b, "PublicKey")[:8], ", ".join(bad)))
 
 
 def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
@@ -687,7 +843,9 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
     CHANGED; LIMIT<TAB>имя<TAB>адрес<TAB>текст; WARN90<TAB>имя<TAB>текст;
     UNLIMIT<TAB>имя<TAB>текст; SLOW<TAB>имя<TAB>Мбит/с<TAB>текст;
     UNSLOW<TAB>имя<TAB>текст. Мягкий лимит («# limit_slow=N»): исчерпавший
-    не блокируется, а замедляется до N Мбит/с («# slowed_by=traffic»)."""
+    не блокируется, а замедляется до N Мбит/с («# slowed_by=traffic»).
+    Повреждённые метки: META и UNMETA — как в expire-check; BADMETA<TAB>имя
+    <TAB>метки — скорость или режим лимита не действуют (один раз)."""
     lock = _traffic_lock(db)
     try:
         text = read(conf)
@@ -697,19 +855,37 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
     t.apply(_read_transfer(transfer), ifindex)
     now = int(time.time())
     head, peers = split_peers(text)
-    events, changed, alive = [], False, set()
+    events, changed, alive, dirty = [], False, set(), False
     for i, b in enumerate(peers):
         pub, aip = peer_field(b, "PublicKey"), peer_field(b, "AllowedIPs")
         if not (pub and aip):
             continue
         alive.add(pub)
         name = peer_name(b) or pub[:8]
+        peers[i], aip, ev = _meta_guard(b, suspend, aip, now, name)
+        if ev:
+            b = peers[i]
+            changed = True
+            events.append(ev)
+        # Повреждённые скорость и режим лимита не блокируют: скорость не
+        # ограничивается, исчерпавший лимит блокируется — об этом одно
+        # предупреждение, пока набор повреждённых меток тот же
+        soft = ", ".join(k for k in bad_meta(b) if k not in META_HARD)
+        if t.d["badmeta"].get(pub, "") != soft:
+            dirty = True
+            if soft:
+                t.d["badmeta"][pub] = soft
+                events.append("BADMETA\t%s\t%s" % (name, soft))
+            else:
+                t.d["badmeta"].pop(pub, None)
+        if peer_meta(b, "blocked_by") == "meta":
+            continue
         limit, period = parse_limit(peer_meta(b, "limit"))
         slow = _mbit(peer_meta(b, "limit_slow"))
         by_traffic = peer_meta(b, "blocked_by") == "traffic"
         slowed = peer_meta(b, "slowed_by") == "traffic"
-        exp = peer_meta(b, "expires")
-        expired = exp.isdigit() and now >= int(exp)
+        exp = meta_int(peer_meta(b, "expires"))
+        expired = isinstance(exp, int) and now >= exp
         used = t.used(pub, period) if limit else 0
         word = "%s из %s %s" % (fmt_bytes(used), fmt_bytes(limit), PERIOD_WORD.get(period, "")) if limit else ""
         over = bool(limit) and used >= limit
@@ -725,16 +901,21 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
                     events.append("UNLIMIT\t%s\t%s" % (name, word or "лимит снят"))
             changed = True
             b, aip = peers[i], peer_field(peers[i], "AllowedIPs")
+        # Заблокированный сроком: метка замедления ведётся и дальше — после
+        # продления сразу действует положенная скорость, — но сообщений о
+        # скорости заблокированного нет: «снова полная скорость» было бы неправдой
+        blocked = aip == suspend
         if slowed and not (over and slow):
             peers[i] = b = set_meta(b, "slowed_by", "")
             changed = True
-            if not over:
+            if not over and not blocked:
                 events.append("UNSLOW\t%s\t%s" % (name, word or "лимит снят"))
         if over and slow:
             if not slowed:
                 peers[i] = set_meta(b, "slowed_by", "traffic")
                 changed = True
-                events.append("SLOW\t%s\t%d\t%s" % (name, slow, word))
+                if not blocked:
+                    events.append("SLOW\t%s\t%d\t%s" % (name, slow, word))
         elif over and aip != suspend:
             peers[i] = _block(b, suspend, aip, "traffic")
             changed = True
@@ -748,7 +929,7 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
         write_atomic(conf, head + "".join(peers))
         print("CHANGED")
     day_changed = time.strftime("%Y-%m-%d", time.localtime(t.saved)) != time.strftime("%Y-%m-%d")
-    if events or changed or day_changed or force_save == "1" or now - t.saved >= TRAFFIC_SAVE_EVERY:
+    if events or changed or dirty or day_changed or force_save == "1" or now - t.saved >= TRAFFIC_SAVE_EVERY:
         t.save(alive)
     del lock
     for e in events:
@@ -835,6 +1016,8 @@ def cmd_limit_reset(conf, db, name, transfer="", ifindex=""):
     if i < 0:
         die("клиент %s не найден" % name, 2)
     limit, period = parse_limit(peer_meta(peers[i], "limit"))
+    if limit_bad(peer_meta(peers[i], "limit")):
+        die("метка лимита у %s повреждена — задай лимит заново" % name)
     if not limit:
         die("у клиента %s нет лимита" % name)
     t = Traffic(db)
@@ -1851,6 +2034,68 @@ def cmd_json_kv():
     print(json.dumps(out, ensure_ascii=False))
 
 
+DNS_PROTO = {1: "DNSCrypt", 3: "DoT", 4: "DoQ", 5: "ODoH", 0x81: "релей DNSCrypt", 0x85: "релей ODoH"}
+
+
+def _dns_stamps(path):
+    """public-resolvers.md → {имя: [(протокол, адрес), ...]} по штампам sdns://."""
+    out, name = {}, None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read(8 << 20)
+    for line in text.splitlines():
+        if line.startswith("## "):
+            name = line[3:].strip()
+            continue
+        line = line.strip()
+        if not (name and line.startswith("sdns://")):
+            continue
+        try:
+            b = base64.urlsafe_b64decode(line[7:] + "=" * (-len(line[7:]) % 4))
+        except ValueError:          # и binascii.Error
+            continue
+        if not b:
+            continue
+        addr = ""
+        if b[0] in (1, 2, 3, 4) and len(b) > 9:
+            addr = b[10:10 + b[9]].decode("ascii", "replace")
+        out.setdefault(name, []).append((b[0], addr))
+    return out
+
+
+def cmd_dns_check(path, *names):
+    """Имена резолверов, которые dnscrypt-proxy Тулзы (только DoH, только IPv4)
+    отбросит, — с причиной и подсказкой. Код 1, если такие есть."""
+    st = _dns_stamps(path)
+    usable = sorted(n for n, v in st.items() if any(p == 2 and not a.startswith("[") for p, a in v))
+    ok = set(usable)
+
+    def alt(n, *cand):
+        for c in cand:
+            if c in ok:
+                return c
+        m = difflib.get_close_matches(n, usable, 1, 0.75)
+        return m[0] if m else ""
+
+    bad = []
+    for n in names:
+        if n in ok:
+            continue
+        v = st.get(n)
+        if not v:
+            a = alt(n, n + "-doh")
+            bad.append("«%s» нет в списке public-resolvers%s" % (n, " — может, %s?" % a if a else ""))
+        elif all(p != 2 for p, _ in v):
+            a = alt(n, n + "-doh", n.replace("dnscrypt", "doh"))
+            bad.append("«%s» — это %s, а шифрованный DNS Тулзы ходит только по DoH%s"
+                       % (n, DNS_PROTO.get(v[0][0], "не DoH"), ": возьми %s" % a if a else ""))
+        else:
+            a = alt(n, n.replace("-ipv6", ""))
+            bad.append("«%s» — только IPv6, а к резолверам сервер ходит по IPv4%s" % (n, ": возьми %s" % a if a else ""))
+    if bad:
+        print("\n".join(bad))
+        sys.exit(1)
+
+
 def cmd_json_rows(*cols):
     """Строки TSV → список объектов по колонкам «имя[:тип]»."""
     spec = [_split_key(c) for c in cols]
@@ -1913,7 +2158,7 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
         name = peer_name(b)
         orig = peer_meta(b, "orig_ips")
         ip = _first_ip(orig or peer_field(b, "AllowedIPs"))
-        exp = peer_meta(b, "expires")
+        exp = meta_int(peer_meta(b, "expires"))
         s = stats.get(pub) or ["", "", "", "", "0", "0", "0"]
         hs = int(s[4]) if s[4].isdigit() else 0
         path = ""
@@ -1924,12 +2169,14 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
                 break
         row = {
             "name": name, "ip": ip, "pub": pub,
-            "expires": int(exp) if exp.isdigit() else None, "blocked": bool(orig),
+            "expires": exp if exp is not BAD else None, "blocked": bool(orig),
             "mimicry": peer_meta(b, "mimicry") or "none",
             "handshake": hs, "ago": now - hs if hs else None,
             "online": bool(hs) and now - hs < 180,
             "rx": int(s[5]) if s[5].isdigit() else 0, "tx": int(s[6]) if s[6].isdigit() else 0,
             "endpoint": "" if s[2] in ("", "(none)") else s[2], "file": path,
+            # Перенесён из Amnezia: приватный ключ только у клиента — исходное имя
+            "amnezia": peer_meta(b, "amnezia") or None,
         }
         limit, period = parse_limit(peer_meta(b, "limit"))
         by = peer_meta(b, "blocked_by")
@@ -1937,7 +2184,9 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
                    blocked_by=(by or "expire") if orig else None,
                    speed=_mbit(peer_meta(b, "speed")) or None,
                    limit_slow=_mbit(peer_meta(b, "limit_slow")) or None,
-                   slowed=peer_meta(b, "slowed_by") == "traffic",
+                   # Заблокированный не «замедлен»: метку таймер держит до продления
+                   slowed=peer_meta(b, "slowed_by") == "traffic" and not orig,
+                   bad_meta=bad_meta(b),
                    used=traffic.used(pub, period) if traffic and limit else None,
                    month=traffic.raw_used(pub, "month") if traffic else None,
                    today=sum((traffic.d["days"].get(today) or {}).get(pub) or [0, 0]) if traffic else None)
@@ -2322,12 +2571,308 @@ def cmd_web_hash():
     print("scrypt$%d$%d$%d$%s$%s" % (2 ** 14, 8, 1, base64.b64encode(salt).decode(), base64.b64encode(dk).decode()))
 
 
+# ── Перенос из Amnezia (Docker) ──
+# Файлы из контейнера Amnezia — недоверенные данные: контейнер мог быть
+# изменён, а его конфиг пойдёт в awg-quick под root. Берём только известные
+# ключи с проверенными значениями; команды (PostUp, PreUp…) и всё прочее
+# отбрасываются, о каждом пропуске — предупреждение.
+AMN_RANGE = r"[0-9]{1,10}(?:-[0-9]{1,10})?"
+AMN_KEYS = (
+    ("Jc", r"[0-9]{1,3}"), ("Jmin", r"[0-9]{1,4}"), ("Jmax", r"[0-9]{1,4}"),
+    ("S1", r"[0-9]{1,4}"), ("S2", r"[0-9]{1,4}"), ("S3", r"[0-9]{1,4}"), ("S4", r"[0-9]{1,2}"),
+    ("H1", AMN_RANGE), ("H2", AMN_RANGE), ("H3", AMN_RANGE), ("H4", AMN_RANGE),
+    ("HeaderProtectionKey", "key"), ("ContentPaddingAddition", AMN_RANGE),
+    ("RekeyAfterTime", AMN_RANGE), ("RekeyTimeout", AMN_RANGE), ("RejectAfterTime", AMN_RANGE),
+    ("KeepaliveTimeout", AMN_RANGE), ("MaxHandshakeAttempts", AMN_RANGE),
+    ("RandomTrailers", r"(?:on|off|true|false|0|1)"), ("DisableCookies", r"(?:on|off|true|false|0|1)"),
+)
+AMN_MTU = 1376              # как у клиентов Amnezia: новые клиенты Тулзы получат тот же MTU
+AMN_TRANSLIT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюяєіїґ", (
+    "a b v g d e e zh z i y k l m n o p r s t u f kh ts ch sh sch - y - e yu ya e i yi g").split()))
+
+
+def _b64key(v):
+    if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", v or ""):
+        return False
+    try:
+        return len(base64.b64decode(v, validate=True)) == 32
+    except ValueError:
+        return False
+
+
+def _amn_value(key, rx, v):
+    if rx == "key":
+        return _b64key(v)
+    if not re.fullmatch(rx, v, re.I):
+        return False
+    # Диапазоны и числа — в uint32, «от» не больше «до»
+    nums = [int(x) for x in re.findall(r"[0-9]+", v)]
+    return all(n <= 0xFFFFFFFF for n in nums) and (len(nums) < 2 or nums[0] <= nums[1])
+
+
+def _amn_parse_conf(text):
+    """→ (interface {ключ: значение}, [peer {ключ: значение}], [непереносимые ключи])."""
+    iface, peers, cur, extra = {}, [], None, []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        sec = re.fullmatch(r"\[\s*(\w+)\s*\]", line)
+        if sec:
+            name = sec.group(1).lower()
+            if name == "interface":
+                cur = iface
+            elif name == "peer":
+                cur = {}
+                peers.append(cur)
+            else:
+                cur = None
+                extra.append("[%s]" % sec.group(1)[:20])
+            continue
+        m = re.fullmatch(r"([A-Za-z0-9]{1,40})\s*=\s*(.*?)", line)
+        if not m or cur is None:
+            extra.append(line[:20])
+            continue
+        k = m.group(1)
+        if k in cur:
+            extra.append(k)          # повтор ключа: берём первое значение
+            continue
+        cur[k] = m.group(2)
+    return iface, peers, extra
+
+
+def _amn_names(table_text):
+    """clientsTable → {публичный ключ: имя}."""
+    out = {}
+    try:
+        data = json.loads(table_text) if table_text.strip() else []
+    except ValueError:
+        return out, ["таблица клиентов не JSON — имена не перенесены"]
+    if not isinstance(data, list):
+        return out, ["таблица клиентов не список — имена не перенесены"]
+    for row in data[:5000]:
+        if not isinstance(row, dict):
+            continue
+        pub, ud = row.get("clientId"), row.get("userData")
+        name = ud.get("clientName") if isinstance(ud, dict) else None
+        if isinstance(pub, str) and _b64key(pub) and isinstance(name, str):
+            out.setdefault(pub, name)
+    return out, []
+
+
+def _amn_label(orig):
+    """Исходное имя для метки: без управляющих символов, переводов строк и «=»."""
+    s = "".join(ch for ch in orig if ch.isprintable() and ch not in "\r\n=")
+    return re.sub(r"\s+", " ", s).strip()[:64]
+
+
+def _amn_slug(orig):
+    out = []
+    for ch in orig:
+        t = AMN_TRANSLIT.get(ch.lower())
+        if t is None:
+            out.append(ch)
+        elif t != "-":
+            out.append(t.capitalize() if ch.isupper() else t)
+    s = re.sub(r"[^A-Za-z0-9_-]+", "_", "".join(out)).strip("_-")
+    return re.sub(r"_+", "_", s)[:32].strip("_-")
+
+
+def amnezia_model(conf_text, table_text, host_port=""):
+    """Проверенная модель сервера Amnezia: {iface, peers, ...}, ошибки, предупреждения."""
+    import ipaddress
+    errors, warns = [], []
+    iface, peers, extra = _amn_parse_conf(conf_text)
+    if extra:
+        warns.append("не переносится: " + ", ".join(sorted(set(extra)))[:300])
+    priv = iface.get("PrivateKey", "")
+    if not _b64key(priv):
+        errors.append("нет ключа сервера (PrivateKey) или он повреждён")
+    port = iface.get("ListenPort", "")
+    if not (re.fullmatch(r"[0-9]{1,5}", port) and 1 <= int(port) <= 65535):
+        errors.append("порт сервера (ListenPort) не задан или неверный")
+        port = ""
+    if re.fullmatch(r"[0-9]{1,5}", host_port or "") and 1 <= int(host_port) <= 65535 and host_port != port:
+        warns.append("порт контейнера %s проброшен наружу как %s — сервер будет слушать %s" % (port, host_port, host_port))
+        port = host_port
+    net = addr = None
+    for a in [x.strip() for x in iface.get("Address", "").split(",") if x.strip()]:
+        try:
+            itf = ipaddress.ip_interface(a)
+        except ValueError:
+            continue
+        if itf.version == 4 and 16 <= itf.network.prefixlen <= 30 and itf.network.is_private:
+            net, addr = itf.network, a
+            break
+        warns.append("адрес %s не переносится" % a[:45])
+    if net is None:
+        errors.append("нет адреса сервера IPv4 в частной подсети (/16–/30)")
+    params, mtu = [], AMN_MTU
+    for k, rx in AMN_KEYS:
+        if k in iface:
+            v = iface[k].strip()
+            if _amn_value(k, rx, v):
+                params.append((k, v))
+            else:
+                errors.append("параметр %s: неверное значение" % k)
+    m = iface.get("MTU", "")
+    if m:
+        if re.fullmatch(r"[0-9]{3,4}", m) and 576 <= int(m) <= 9000:
+            mtu = int(m)
+        else:
+            warns.append("MTU сервера неверный — будет %d" % AMN_MTU)
+    known = {"PrivateKey", "ListenPort", "Address", "MTU"} | {k for k, _ in AMN_KEYS}
+    dropped = sorted(k for k in iface if k not in known)
+    if dropped:
+        warns.append("не переносится из [Interface]: " + ", ".join(dropped)[:200])
+    keys = dict(params)
+    if "RandomTrailers" in keys or "DisableCookies" in keys:
+        proto = "3.1"
+    elif "HeaderProtectionKey" in keys:
+        proto = "3.0"
+    else:
+        proto = "2.0"
+    names, w = _amn_names(table_text)
+    warns += w
+    out, seen_pub, seen_ip, used = [], set(), set(), set()
+    for i, p in enumerate(peers):
+        pub, psk = p.get("PublicKey", ""), p.get("PresharedKey", "")
+        if not _b64key(pub) or pub in seen_pub:
+            warns.append("пир %d пропущен: нет ключа, ключ повреждён или повторяется" % (i + 1))
+            continue
+        if psk and not _b64key(psk):
+            warns.append("пир %d пропущен: PresharedKey повреждён" % (i + 1))
+            continue
+        ips = []
+        for a in [x.strip() for x in p.get("AllowedIPs", "").split(",") if x.strip()]:
+            try:
+                n = ipaddress.ip_network(a, strict=True)
+            except ValueError:
+                n = None
+            if n is not None and n.version == 4 and n.prefixlen == 32 and net is not None \
+                    and n.network_address in net and str(n) not in seen_ip \
+                    and str(n.network_address) != str(addr).split("/")[0]:
+                ips.append(str(n))
+        if not ips:
+            warns.append("пир %d пропущен: нет своего адреса /32 в подсети сервера" % (i + 1))
+            continue
+        seen_pub.add(pub)
+        seen_ip.update(ips)
+        orig = _amn_label(names.get(pub, ""))
+        name = _amn_slug(orig) or "amnezia_" + ips[0].split("/")[0].rsplit(".", 1)[1]
+        base, n = name, 2
+        while name.lower() in used:
+            sfx = "_%d" % n
+            name, n = base[:32 - len(sfx)] + sfx, n + 1
+        used.add(name.lower())
+        out.append({"name": name, "orig": orig, "ip": ips[0].split("/")[0], "pub": pub, "psk": psk,
+                    "allowed": ", ".join(ips)})
+    if not out and not errors:
+        warns.append("клиентов не найдено — перенесётся пустой сервер")
+    model = {"proto": proto, "port": int(port) if port else 0, "net": str(net) if net else "",
+             "address": addr or "", "mtu": mtu, "params": params, "priv": priv, "peers": out}
+    return model, errors, warns
+
+
+def _amn_load(dir_):
+    conf = ""
+    for n in ("awg0.conf", "wg0.conf"):
+        f = os.path.join(dir_, n)
+        if os.path.isfile(f):
+            conf = read(f)
+            break
+    table = os.path.join(dir_, "clientsTable")
+    port = os.path.join(dir_, "host_port")
+    return amnezia_model(conf, read(table) if os.path.isfile(table) else "",
+                         read(port).strip() if os.path.isfile(port) else "")
+
+
+def cmd_amnezia_scan(dir_, container="", running="0", blockers="", notes=""):
+    """Сводка для меню, бота и панели — без ключей. blockers — что мешает
+    переносу (server, components, proto) — считает awg2; notes=dns — рядом
+    работает контейнер AmneziaDNS."""
+    m, errors, warns = _amn_load(dir_)
+    if notes == "dns":
+        warns.append("рядом работает AmneziaDNS (amnezia-dns) — переносом не трогается; клиенты с DNS 172.29.172.254 "
+                     "ходят через него и дальше, пока контейнер работает")
+    print(json.dumps({"container": container, "running": running == "1", "migrated": False,
+                      "proto": m["proto"], "port": m["port"], "net": m["net"], "address": m["address"],
+                      "mtu": m["mtu"], "clients": [{"name": p["name"], "orig": p["orig"], "ip": p["ip"]}
+                                                    for p in m["peers"]],
+                      "errors": errors, "warnings": warns,
+                      "blockers": [b for b in blockers.split(",") if b]}, ensure_ascii=False))
+
+
+AMN_BLOCK = {"server": "сервер Тулзы уже создан — перенос только на сервер без своего awg0",
+             "components": "сначала установи компоненты (Сервер → Установить компоненты)",
+             "proto": "модуль ядра не умеет эту версию AWG — обнови модуль"}
+
+
+def cmd_amnezia_show():
+    """Сводка amnezia-scan (stdin) — текстом для меню awg2."""
+    d = json.loads(sys.stdin.read() or "{}")
+    print("  Контейнер : %s (%s)" % (d.get("container") or "—", "работает" if d.get("running") else "остановлен"))
+    print("  AWG %s, порт %s/udp, подсеть %s, клиентов: %d" % (d.get("proto"), d.get("port"), d.get("net"),
+                                                              len(d.get("clients") or [])))
+    for c in (d.get("clients") or [])[:60]:
+        orig = c.get("orig") or ""
+        print("    %-15s %s%s" % (c.get("ip"), c.get("name"), "  ← " + orig if orig and orig != c.get("name") else ""))
+    for w in d.get("warnings") or []:
+        print("  ⚠ " + w)
+    for e in d.get("errors") or []:
+        print("  ✖ " + e)
+    for b in d.get("blockers") or []:
+        print("  ✖ " + AMN_BLOCK.get(b, b))
+    if d.get("errors") or d.get("blockers"):
+        sys.exit(1)                 # переносить нельзя — меню не спрашивает «yes»
+    print("  Конфиги клиентов останутся прежними. Приватных ключей клиентов на сервере нет —")
+    print("  для перенесённых Тулза не покажет конфиг и QR, а перевыпустит их по просьбе.")
+
+
+def cmd_amnezia_conf(dir_, part):
+    """Конфиг сервера Тулзы: part=iface — шапка и [Interface], peers — клиенты."""
+    m, errors, _ = _amn_load(dir_)
+    if errors:
+        die("; ".join(errors))
+    if part == "iface":
+        print("# AWG_PROFILE=lite")
+        print("# AmneziaWG Toolza — AWG %s server config (перенесён из Amnezia)" % m["proto"])
+        print("# Region: world")
+        print("# AWG_PROTO=%s" % m["proto"])
+        print("# AWG_OBF_LEVEL=1")
+        print("# AWG_MIMICRY=none")
+        print("# AWG_IMPORTED=amnezia")
+        print("[Interface]")
+        print("PrivateKey = %s" % m["priv"])
+        print("Address = %s" % m["address"])
+        print("ListenPort = %d" % m["port"])
+        print("MTU = %d" % m["mtu"])
+        for k, v in m["params"]:
+            print("%s = %s" % (k, v))
+    elif part == "peers":
+        for p in m["peers"]:
+            print("\n[Peer]\n# %s" % p["name"])
+            if p["orig"] and p["orig"] != p["name"]:
+                print("# amnezia=%s" % p["orig"])
+            else:
+                print("# amnezia=%s" % p["name"])
+            print("PublicKey = %s" % p["pub"])
+            if p["psk"]:
+                print("PresharedKey = %s" % p["psk"])
+            print("AllowedIPs = %s" % p["allowed"])
+    elif part == "net":
+        print(m["net"])
+    else:
+        die("часть: iface|peers|net")
+
+
 COMMANDS = {
     "peers": cmd_peers, "meta-set": cmd_meta_set, "peer-del": cmd_peer_del,
-    "peer-rename": cmd_peer_rename, "peers-clear": cmd_peers_clear,
+    "peer-rename": cmd_peer_rename, "peer-rekey": cmd_peer_rekey, "meta-get": cmd_meta_get, "traffic-rekey": cmd_traffic_rekey, "peers-clear": cmd_peers_clear,
     "params-replace": cmd_params_replace, "keepalive-set": cmd_keepalive_set, "params-check": cmd_params_check,
     "i-replace": cmd_i_replace,
-    "expire-set": cmd_expire_set, "expire-clear": cmd_expire_clear,
+    "amnezia-scan": cmd_amnezia_scan, "amnezia-conf": cmd_amnezia_conf, "amnezia-show": cmd_amnezia_show,
+    "expire-set": cmd_expire_set, "expire-clear": cmd_expire_clear, "meta-check": cmd_meta_check,
     "expire-check": cmd_expire_check,
     "traffic-tick": cmd_traffic_tick, "traffic-daily": cmd_traffic_daily, "traffic-now": cmd_traffic_now,
     "traffic-rows": cmd_traffic_rows, "traffic-report": cmd_traffic_report,
@@ -2347,7 +2892,7 @@ COMMANDS = {
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
     "pcap-analyze": cmd_pcap_analyze, "safe-untar": cmd_safe_untar,
     "cert-find": cmd_cert_find, "changelog-json": cmd_changelog_json,
-    "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "json-list": cmd_json_list,
+    "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "dns-check": cmd_dns_check, "json-list": cmd_json_list,
     "clients-json": cmd_clients_json, "api-envelope": cmd_api_envelope,
     "api-job-status": cmd_api_job_status, "api-jobs": cmd_api_jobs,
     "tg-targets": cmd_tg_targets,

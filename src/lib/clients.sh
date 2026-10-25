@@ -97,9 +97,45 @@ client_rename() {  # старое новое
   ok "Переименован: $old → $new"
 }
 
+# Нет файла конфига — почему: перенесённый из Amnezia хранит его только у себя.
+client_no_conf() {  # имя
+  if server_exists && [[ -n "$(py meta-get "$SERVER_CONF" "$1" amnezia 2>/dev/null)" ]]; then
+    err "Конфиг клиента $1 есть только у него самого: клиент перенесён из Amnezia. Нужен новый — «Перевыпустить конфиг»"
+  else
+    err "Нет конфига клиента $1"
+  fi
+  return 1
+}
+
+# Перевыпуск: новый ключ клиенту, адрес, сроки, лимиты, скорость и маршруты —
+# прежние. Старый конфиг перестаёт работать. Для перенесённых из Amnezia —
+# способ получить конфиг и QR в Тулзе.
+client_reissue() {  # имя
+  local name="$1" old priv pub psk addr
+  old=$(client_pub "$name")
+  [[ -n "$old" ]] || { err "Клиента $name нет"; return 1; }
+  priv=$(awg genkey) && pub=$(awg pubkey <<< "$priv") && psk=$(awg genpsk) || return 1
+  addr=$(py peer-rekey "$SERVER_CONF" "$old" "$pub" "$psk") || return 1
+  addr="${addr%%,*}"
+  if iface_up; then
+    awg set "$AWG_IF" peer "$old" remove 2>/dev/null
+    awg set "$AWG_IF" peer "$pub" preshared-key <(printf '%s\n' "$psk") \
+      allowed-ips "$(clients_tsv | awk -F'\t' -v k="$pub" '$2 == k {print $3; exit}')" \
+      || warn "Ядро не приняло новый ключ — перезапусти awg0"
+  fi
+  [[ -f "$TRAFFIC_DB" ]] && { py traffic-rekey "$TRAFFIC_DB" "$old" "$pub" || warn "Счётчики трафика начнутся заново"; }
+  rm -f "$EXPIRE_STATE_DIR/warn1h_${old//[^A-Za-z0-9]/_}"
+  mimicry_from_spec server || return 1
+  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "1.1.1.1, 1.0.0.1" "$(conf_iface_get MTU)" || return 1
+  peer_meta_set "$name" mimicry "$(mimicry_tag)" || true
+  log_info "клиент перевыпущен: $name"
+  ok "Новый конфиг $name: $(client_file "$name")"
+  warn "Старый конфиг $name больше не подключится"
+}
+
 # Мимикрия выданного клиента: меняются только его I1-I5 — сервер их не видит.
 client_set_mimicry() {  # имя строка
-  [[ -f "$(client_file "$1")" ]] || { err "Нет конфига клиента $1"; return 1; }
+  [[ -f "$(client_file "$1")" ]] || { client_no_conf "$1"; return 1; }
   mimicry_from_spec "$2" && _client_write_mimicry "$1"
 }
 
@@ -119,24 +155,59 @@ client_expire_set() {  # имя unix-время
   expire_install
   # Заблокированному сначала вернуть адрес: expire-set правит только метку,
   # и клиент остался бы на 127.0.0.2 с новым сроком — «заблокирован» без причины.
-  # Блокировку за трафик новый срок не снимает — её снимает лимит.
+  # Блокировку за трафик новый срок не снимает — её снимает лимит; блокировку
+  # за повреждённые метки — только если повреждён был один срок.
+  local r=""
   if [[ -n "$(peer_meta_get "$1" orig_ips)" && "$(peer_meta_get "$1" blocked_by)" != traffic ]]; then
-    py expire-clear "$SERVER_CONF" "$1" "$EXPIRE_SUSPEND_IP" >/dev/null || return 1
-    _expire_apply
+    r=$(_expire_unblock "$1") || return 1
   fi
   py expire-set "$SERVER_CONF" "$1" "$2" || return 1
   rm -f "$EXPIRE_STATE_DIR/warn1h_$(client_pub "$1" | tr -c 'A-Za-z0-9\n' '_')"
+  # Разблокированный замедленный — сразу на своей скорости, а не до прохода таймера
+  speed_check
   ok "Срок $1: $(expire_fmt "$2")"
+  _expire_held "$1" "$r"
+  return 0
 }
 
 # Снять срок; заблокированный клиент получает прежний адрес.
 client_expire_clear() {
   local r
   client_exists "$1" || { err "Клиента $1 нет"; return 1; }
-  r=$(py expire-clear "$SERVER_CONF" "$1" "$EXPIRE_SUSPEND_IP") || return 1
-  _expire_apply
+  r=$(_expire_unblock "$1") || return 1
+  speed_check
   ok "$1 — бессрочный"
-  [[ "$r" == traffic ]] && warn "$1 остаётся заблокирован: исчерпан лимит трафика"
+  _expire_held "$1" "$r"
+  return 0
+}
+
+# Снять срок и вернуть адрес — если его не держит лимит трафика: сверка с
+# лимитом в той же записи конфига, без окна до прохода таймера. → причина
+# (traffic|slow|meta|пусто) в stdout.
+_expire_unblock() {  # имя
+  local tr r was
+  was=$(peer_meta_get "$1" blocked_by)
+  tr=$(_traffic_snapshot) || return 1
+  r=$(py expire-clear "$SERVER_CONF" "$1" "$EXPIRE_SUSPEND_IP" "$TRAFFIC_DB" "$tr") || { rm -f "$tr"; return 1; }
+  rm -f "$tr"
+  _expire_apply
+  # Блокировку за повреждённый срок снял сам админ — в журнал (ленту панели), без Telegram
+  if [[ "$was" == meta && "$r" != meta ]]; then
+    case "$r" in
+      traffic) echo "$(date '+%F %T') unmeta: $1 (срок исправлен; лимит исчерпан — заблокирован за трафик)" ;;
+      slow) echo "$(date '+%F %T') unmeta: $1 (срок исправлен; лимит исчерпан — замедлен)" ;;
+      *) echo "$(date '+%F %T') unmeta: $1 (срок исправлен — разблокирован)" ;;
+    esac >> "$EXPIRE_LOG"
+  fi
+  printf '%s\n' "$r"
+}
+
+_expire_held() {  # имя причина
+  case "$2" in
+    traffic) warn "$1 остаётся заблокирован: исчерпан лимит трафика" ;;
+    slow) warn "$1: лимит трафика исчерпан — замедлен" ;;
+    meta) warn "$1 остаётся заблокирован: повреждена метка лимита — задай лимит заново" ;;
+  esac
   return 0
 }
 
@@ -173,12 +244,14 @@ limit_fmt() {  # метка limit (БАЙТ/период) использован
   echo "$(fmt_bytes "${2:-0}") из $(fmt_bytes "$n") $([[ "$p" == month ]] && echo "за месяц" || echo "всего")"
 }
 
-# Удалить клиентов с истёкшим сроком. Заблокированных за трафик не трогает:
-# они разблокируются сами в новом месяце или после смены лимита.
+# Удалить клиентов с истёкшим сроком — только их: заблокированные за трафик
+# разблокируются сами в новом месяце или после смены лимита, за повреждённые
+# метки (meta) — после исправления метки; причину, которой этот awg2 не знает,
+# тоже не трогаем.
 clients_purge_blocked() {
   local pub n=0
   while IFS= read -r pub; do client_delete "$pub" && n=$((n + 1)); done \
-    < <(clients_tsv | awk -F'\t' '$5 != "" && $8 != "traffic" {print $2}')
+    < <(clients_tsv | awk -F'\t' '$5 != "" && $8 == "" {print $2}')
   ok "Удалено с истёкшим сроком: $n"
 }
 
@@ -397,6 +470,14 @@ _pick_client_file() {  # → путь в CHOSEN
   CHOSEN="${files[$((c - 1))]}"
 }
 
+do_reissue_client() {
+  local name
+  _pick_client || return 0
+  name="${CHOSEN%%$'\t'*}"
+  ask_yes "  Новый ключ для $name: старый конфиг перестанет работать. Продолжить? [y/N]: " n || return 0
+  client_reissue "$name" && share_config "$(client_file "$name")" qr
+}
+
 do_show_client()    { _pick_client_file && share_config "$CHOSEN"; }
 do_show_client_qr() { _pick_client_file && share_config "$CHOSEN" qr; }
 
@@ -427,12 +508,13 @@ do_list_clients() {
     echo -e "     $st  ↑ $(fmt_bytes "${tx:-0}")  ↓ $(fmt_bytes "${rx:-0}")${ep:+  ${D}${ep%:*}${N}}"
     IFS='|' read -r lim per used month today by <<< "${tl[x$name]:-0|||0|0|}"
     (( ${month:-0} )) && echo -e "     ${D}за месяц $(fmt_bytes "$month"), сегодня $(fmt_bytes "${today:-0}")${N}"
-    if [[ "$by" == traffic ]]; then echo -e "     ${R}заблокирован: исчерпан лимит — $(limit_fmt "$lim/$per" "$used")${N}"
+    if [[ "$by" == meta ]]; then echo -e "     ${R}заблокирован: повреждена метка срока или лимита — задай заново${N}"
+    elif [[ "$by" == traffic ]]; then echo -e "     ${R}заблокирован: исчерпан лимит — $(limit_fmt "$lim/$per" "$used")${N}"
     elif [[ "${lim:-0}" != 0 ]]; then echo -e "     ${D}лимит: $(limit_fmt "$lim/$per" "$used")${N}"; fi
-    sp=$(speed_fmt "$sp" "$slow" "$sby")
+    sp=$(speed_fmt "$sp" "$slow" "$([[ -z "$orig" ]] && echo "$sby")")
     [[ -n "$sp" ]] && echo -e "     ${D}скорость: $sp${N}"
     if [[ -n "$exp" ]]; then
-      if [[ -n "$orig" && "$by" != traffic ]]; then echo -e "     ${R}заблокирован: срок истёк $(expire_fmt "$exp")${N}"
+      if [[ -n "$orig" && "$by" != traffic && "$by" != meta ]]; then echo -e "     ${R}заблокирован: срок истёк $(expire_fmt "$exp")${N}"
       elif [[ -z "$orig" ]]; then echo -e "     ${Y}срок: $(expire_fmt "$exp")${N}"; fi
     fi
   done < <(clients_psv)
@@ -477,14 +559,16 @@ do_clients_menu() {
     echo -e "  ${C}8)${N} Экспорт всех (zip)"
     echo -e "  ${C}9)${N} Сменить мимикрию"
     echo -e "  ${R}10)${N} Удалить"
+    echo -e "  ${C}11)${N} Перевыпустить конфиг ${D}— новый ключ; перенесённым из Amnezia — конфиг и QR${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-10]: ${N}" 0 10 0
+    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
     case "$c" in
       1) do_add_client || true ;;     6) do_bulk_add || true ;;
       2) do_list_clients || true ;;   7) do_expire_menu || true ;;
       3) do_show_client || true ;;    8) do_export_clients || true ;;
       4) do_show_client_qr || true ;; 9) do_change_mimicry || true ;;
       5) do_rename_client || true ;;  10) do_delete_client || true ;;
+      11) do_reissue_client || true ;;
       0) return 0 ;;
     esac
     pause
