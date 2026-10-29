@@ -96,6 +96,46 @@ class StorageTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "хранилища"):
                 self.create()
 
+    def test_missing_file_initializes_first_link(self):
+        self.assertFalse(share._file().exists())
+        token, rid, _ = self.create()
+        self.assertIsNotNone(share._lookup(token))
+        self.assertTrue(share.revoke(rid))
+
+    def test_corrupt_or_wrong_type_state_is_never_overwritten(self):
+        token, rid, _ = self.create()
+        good = share._file().read_bytes()
+        for raw in (b"{broken", b"\xff", b"[]", b"null", b"42"):
+            for op in (self.create, lambda: share.revoke(rid), lambda: share._lookup(token),
+                       lambda: share._lookup(token, count=True)):
+                with self.subTest(raw=raw, operation=op):
+                    share._file().write_bytes(raw)
+                    with patch.object(store, "save", wraps=store.save) as save:
+                        with self.assertRaises(share.PersistenceError):
+                            op()
+                        save.assert_not_called()
+                    self.assertEqual(share._file().read_bytes(), raw)
+        share._file().write_bytes(good)
+        self.assertIsNotNone(share._lookup(token, count=True))
+        self.assertTrue(share.revoke(rid))
+        self.assertIsNotNone(share._lookup(self.create()[0]))
+
+    def test_unreadable_state_is_never_overwritten(self):
+        token, rid, _ = self.create()
+        raw = share._file().read_bytes()
+        for code in (errno.EIO, errno.EACCES):
+            for op in (self.create, lambda: share.revoke(rid), lambda: share._lookup(token),
+                       lambda: share._lookup(token, count=True)):
+                with self.subTest(errno=code, operation=op):
+                    with patch.object(Path, "read_text", side_effect=OSError(code, "injected")), \
+                            patch.object(store, "save", wraps=store.save) as save:
+                        with self.assertRaises(share.PersistenceError):
+                            op()
+                        save.assert_not_called()
+                    self.assertEqual(share._file().read_bytes(), raw)
+        self.assertIsNotNone(share._lookup(token, count=True))
+        self.assertTrue(share.revoke(rid))
+
     def test_ttl(self):
         token, _, exp = self.create()
         with patch.object(share.time, "time", return_value=exp):
@@ -170,6 +210,53 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("qr", body)
                 fetch.assert_not_awaited()
         self.assertFalse(share._fails)
+
+    async def test_http_read_failures_are_503_without_config_or_writes(self):
+        token, rid, _ = share.create("alice", "TEST-PUBLIC", "test")
+        good = share._file().read_bytes()
+        real_read = Path.read_text
+        for raw, error in ((b"{broken", None), (b"[]", None), (good, OSError(errno.EIO, "injected"))):
+            share._file().write_bytes(raw)
+            for path, body in (("/api/client/share", {"name": "alice"}),
+                               ("/api/client/share/revoke", {"id": rid}),
+                               (f"/s/{token}", None), (f"/s/{token}/data", {}), (f"/s/{token}/file", {})):
+                with self.subTest(path=path, raw=raw, error=error):
+                    with patch.object(Path, "read_text", side_effect=error or real_read, autospec=True), \
+                            patch.object(store, "save", wraps=store.save) as save, \
+                            patch.object(share, "_client", AsyncMock()) as fetch:
+                        response = (await self.http.get(path) if body is None
+                                    else await self.http.post(path, json=body))
+                        self.assertEqual(response.status, 503)
+                        text = await response.text()
+                        self.assertIn("хранилищ", (await response.json())["error"]
+                                      if response.content_type == "application/json" else text)
+                        self.assertNotIn('"text":', text)
+                        self.assertNotIn('"qr":', text)
+                        fetch.assert_not_awaited()
+                        save.assert_not_called()
+                    self.assertEqual(share._file().read_bytes(), raw)
+        share._file().write_bytes(good)
+        self.assertIsNotNone(share._lookup(token))
+        self.assertFalse(share._fails)
+
+    async def test_telegram_read_error_is_not_reported_as_missing_link(self):
+        token, rid, _ = share.create("alice", "TEST-PUBLIC", "test")
+        good = share._file().read_bytes()
+        real_read = Path.read_text
+        for raw, error in ((b"{broken", None), (good, OSError(errno.EACCES, "injected"))):
+            share._file().write_bytes(raw)
+            cb = Mock(answer=AsyncMock())
+            with patch.object(Path, "read_text", side_effect=error or real_read, autospec=True), \
+                    patch.object(clients, "card", AsyncMock()) as card:
+                await clients._share_revoke(cb, None, f"alice|{rid}")
+                text = cb.answer.call_args.args[0]
+                self.assertIn("хранилищ", text)
+                self.assertNotIn("Ссылка уже не действует", text)
+                self.assertNotIn("Ссылка отозвана", text)
+                card.assert_not_awaited()
+            self.assertEqual(share._file().read_bytes(), raw)
+        share._file().write_bytes(good)
+        self.assertIsNotNone(share._lookup(token))
 
     async def test_http_success_and_recovery_after_failed_count(self):
         token, _, _ = share.create("alice", "TEST-PUBLIC", "test")

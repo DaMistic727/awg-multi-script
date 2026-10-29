@@ -64,7 +64,7 @@ def _digest(token: str) -> str:
 
 
 class PersistenceError(RuntimeError):
-    """Состояние ссылок не удалось сохранить или заблокировать."""
+    """Состояние ссылок не удалось прочитать, сохранить или заблокировать."""
 
     def __init__(self) -> None:
         super().__init__("Ошибка хранилища ссылок. Попробуйте позже.")
@@ -98,7 +98,14 @@ class _Lock:
 
 
 def _load(now: float) -> dict[str, dict]:
-    data = store.load(_file())
+    try:
+        data = json.loads(_file().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
+        raise PersistenceError() from e
+    if not isinstance(data, dict):
+        raise PersistenceError()
     return {k: v for k, v in data.items() if isinstance(v, dict) and float(v.get("exp") or 0) > now}
 
 
